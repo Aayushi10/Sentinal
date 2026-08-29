@@ -35,8 +35,8 @@ Environment variables (loaded from .env in the same directory):
 from __future__ import annotations
 
 import hashlib
+import math
 import os
-import urllib.parse
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -63,6 +63,19 @@ mcp = FastMCP(
         "consequential actions such as dispatching resources or escalating."
     ),
 )
+
+# ---------------------------------------------------------------------------
+# Constants / hard limits
+# ---------------------------------------------------------------------------
+
+# search_reports caps — prevent full-table scans and oversized responses.
+_MAX_RADIUS_M      = 10_000   # 10 km — hard ceiling on search radius
+_MAX_SINCE_MINUTES = 1_440    # 24 h  — hard ceiling on time window
+_MAX_RESULTS       = 100      # maximum rows returned in a single call
+
+# Valid WGS-84 coordinate ranges.
+_LAT_RANGE = (-90.0, 90.0)
+_LNG_RANGE = (-180.0, 180.0)
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -93,6 +106,15 @@ def _row_to_report(row: tuple) -> dict[str, Any]:
     }
 
 
+def _validate_coords(lat: float, lng: float) -> str | None:
+    """Return an error string if coordinates are out of WGS-84 range, else None."""
+    if not (_LAT_RANGE[0] <= lat <= _LAT_RANGE[1]):
+        return f"center_lat={lat} is out of valid range {_LAT_RANGE}"
+    if not (_LNG_RANGE[0] <= lng <= _LNG_RANGE[1]):
+        return f"center_lng={lng} is out of valid range {_LNG_RANGE}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Tool 1 – search_reports (READ-ONLY)
 # ---------------------------------------------------------------------------
@@ -105,6 +127,7 @@ def search_reports(
     radius_m: int = 400,
     since_minutes: int = 45,
     category: str | None = None,
+    limit: int = 50,
 ) -> dict:
     """
     Find recent reports within a geographic radius of a given coordinate.
@@ -118,30 +141,56 @@ def search_reports(
     Parameters
     ----------
     center_lat : float
-        Latitude of the search centre (WGS-84 decimal degrees).
+        Latitude of the search centre (WGS-84 decimal degrees, -90 to 90).
     center_lng : float
-        Longitude of the search centre (WGS-84 decimal degrees).
+        Longitude of the search centre (WGS-84 decimal degrees, -180 to 180).
     radius_m : int, default 400
         Search radius in metres. Uses PostGIS ST_DWithin on geography
         so distances are geodetic (accurate at all latitudes).
+        Capped at 10 000 m (10 km). Must be > 0.
     since_minutes : int, default 45
         Only return reports submitted within the last N minutes.
+        Capped at 1 440 (24 h). Must be > 0.
         Use a larger window for older incidents; use a smaller window
         to focus on fast-moving, recent events.
     category : str | None, default None
         If provided, filters by exact category match
         ('fire', 'crime', 'hazard', 'other').
         Pass None to return all categories.
+    limit : int, default 50
+        Maximum number of reports to return. Capped at 100.
+        Results are ordered newest-first within the search window.
 
     Returns
     -------
     dict with keys:
-        reports_found : int   – total number of matching reports
-        radius_m      : int   – the radius used (echoed back for clarity)
-        since_minutes : int   – the time window used
+        reports_found : int   – number of reports returned (≤ limit)
+        radius_m      : int   – the radius actually used
+        since_minutes : int   – the time window actually used
+        limit         : int   – the page size actually used
         reports       : list  – each item has:
             id, text, lat, lng, category, timestamp (ISO-8601), incident_id
+    On validation error:
+        {"error": "<message>"}
     """
+    # --- Input validation (before touching the DB) --------------------------
+    coord_err = _validate_coords(center_lat, center_lng)
+    if coord_err:
+        return {"error": coord_err}
+
+    if radius_m <= 0:
+        return {"error": f"radius_m must be > 0, got {radius_m}"}
+    if since_minutes <= 0:
+        return {"error": f"since_minutes must be > 0, got {since_minutes}"}
+    if limit <= 0:
+        return {"error": f"limit must be > 0, got {limit}"}
+
+    # Apply hard caps to prevent unbounded scans.
+    radius_m      = min(radius_m,      _MAX_RADIUS_M)
+    since_minutes = min(since_minutes, _MAX_SINCE_MINUTES)
+    limit         = min(limit,         _MAX_RESULTS)
+
+    # --- Query --------------------------------------------------------------
     since_time = datetime.now(tz=timezone.utc) - timedelta(minutes=since_minutes)
 
     sql = """
@@ -165,7 +214,8 @@ def search_reports(
         sql += " AND category = %(cat)s"
         params["cat"] = category
 
-    sql += " ORDER BY timestamp DESC"
+    sql += " ORDER BY timestamp DESC LIMIT %(limit)s"
+    params["limit"] = limit
 
     conn = _get_db()
     try:
@@ -179,6 +229,7 @@ def search_reports(
         "reports_found": len(rows),
         "radius_m": radius_m,
         "since_minutes": since_minutes,
+        "limit": limit,
         "reports": [_row_to_report(r) for r in rows],
     }
 
@@ -321,8 +372,8 @@ def geocode_location(description: str) -> dict:
 
 # Simulated station data: (name, base_lat, base_lng)
 _STATIONS = [
-    ("Station 14 – Civic Center", 37.7793, -122.4185),
-    ("Station 8  – Mission District", 37.7645, -122.4118),
+    ("Station 14 – Civic Center",       37.7793, -122.4185),
+    ("Station 8  – Mission District",   37.7645, -122.4118),
     ("Station 3  – Financial District", 37.7960, -122.3993),
     ("Station 1  – Downtown / Tenderloin", 37.7842, -122.4102),
 ]
@@ -330,8 +381,6 @@ _STATIONS = [
 
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Great-circle distance in kilometres (Haversine formula)."""
-    import math
-
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -362,31 +411,35 @@ def check_response_resources(incident_type: str, lat: float, lng: float) -> dict
         Used to label the resource type in the response (no functional effect
         on routing in this simulation).
     lat : float
-        Latitude of the incident (WGS-84 decimal degrees).
+        Latitude of the incident (WGS-84 decimal degrees, -90 to 90).
     lng : float
-        Longitude of the incident (WGS-84 decimal degrees).
+        Longitude of the incident (WGS-84 decimal degrees, -180 to 180).
 
     Returns
     -------
     dict with keys:
-        incident_type     : str   – echoed back
-        units_available   : int   – number of units returned (always 3 in sim)
-        units             : list  – up to 3 nearest simulated units, each with:
+        incident_type   : str  – echoed back
+        units_available : int  – number of units returned (always 3 in sim)
+        units           : list – up to 3 nearest simulated units, each with:
             unit_id     : str   – stable identifier (use as `target` when dispatching)
             name        : str   – human-readable station name
             distance_km : float – straight-line distance from incident (km)
             eta_minutes : int   – simulated ETA (distance × ~4 min/km, rounded)
             status      : str   – always 'AVAILABLE' in this simulation
+    On validation error:
+        {"error": "<message>"}
     """
-    # Compute distance from each simulated station to the incident location.
+    coord_err = _validate_coords(lat, lng)
+    if coord_err:
+        return {"error": coord_err}
+
     scored: list[dict] = []
     for name, slat, slng in _STATIONS:
         dist_km = round(_haversine_km(lat, lng, slat, slng), 2)
-        # Simple ETA model: ~4 minutes per km (urban speed + response overhead)
-        # Add a tiny deterministic jitter per station so ETAs look realistic.
-        jitter_seed = int(hashlib.md5(name.encode()).hexdigest(), 16) % 3  # 0-2 min
-        eta = max(2, round(dist_km * 4) + jitter_seed)
-        # Derive a stable unit_id from the station name
+        # Simple ETA model: ~4 minutes per km (urban speed + response overhead).
+        # Tiny deterministic jitter per station so ETAs look realistic.
+        jitter = int(hashlib.md5(name.encode()).hexdigest(), 16) % 3  # 0-2 min
+        eta = max(2, round(dist_km * 4) + jitter)
         unit_id = "unit_" + name.split("–")[0].strip().lower().replace(" ", "_")
         scored.append(
             {
@@ -398,14 +451,11 @@ def check_response_resources(incident_type: str, lat: float, lng: float) -> dict
             }
         )
 
-    # Return the 3 closest units.
     scored.sort(key=lambda u: u["distance_km"])
-    top3 = scored[:3]
-
     return {
         "incident_type": incident_type,
-        "units_available": len(top3),
-        "units": top3,
+        "units_available": len(scored[:3]),
+        "units": scored[:3],
     }
 
 
@@ -413,12 +463,29 @@ def check_response_resources(incident_type: str, lat: float, lng: float) -> dict
 # Tool 5 – create_incident_action (SIDE-EFFECTING — HUMAN APPROVAL REQUIRED)
 # ---------------------------------------------------------------------------
 
-# Maps the requested action to the resulting incident status.
-_ACTION_STATUS_MAP = {
-    "CREATE_INCIDENT": "INVESTIGATING",
-    "DISPATCH_RESOURCE": "RESPONSE_IN_PROGRESS",
-    "ESCALATE": "PENDING_APPROVAL",
-    "REQUEST_ON_SITE_CONFIRMATION": "INVESTIGATING",
+# Allowed status transitions: {current_status: [allowed_actions]}
+# This enforces a one-way state machine — an incident cannot regress to an
+# earlier state or repeat a transition it has already completed.
+_TRANSITIONS: dict[str, dict[str, str]] = {
+    #                       action                 → new_status
+    "OPEN": {
+        "CREATE_INCIDENT":               "INVESTIGATING",
+        "REQUEST_ON_SITE_CONFIRMATION":  "INVESTIGATING",
+    },
+    "INVESTIGATING": {
+        "DISPATCH_RESOURCE":             "RESPONSE_IN_PROGRESS",
+        "ESCALATE":                      "PENDING_APPROVAL",
+        "REQUEST_ON_SITE_CONFIRMATION":  "INVESTIGATING",   # idempotent re-confirmation
+    },
+    "PENDING_APPROVAL": {
+        "DISPATCH_RESOURCE":             "RESPONSE_IN_PROGRESS",
+    },
+    "RESPONSE_IN_PROGRESS": {
+        "ESCALATE":                      "PENDING_APPROVAL",
+        # DISPATCH_RESOURCE can be repeated to add more units
+        "DISPATCH_RESOURCE":             "RESPONSE_IN_PROGRESS",
+    },
+    "RESOLVED": {},  # terminal state — no actions allowed
 }
 
 
@@ -430,85 +497,84 @@ def create_incident_action(incident_id: str, action: str, target: str) -> dict:
     ⚠️  SIDE-EFFECTING — REQUIRES HUMAN APPROVAL ⚠️
     This tool writes to the database and may trigger real-world responses
     (resource dispatch, escalation to supervisors, on-site confirmation
-    requests). It is IRREVERSIBLE in the sense that once a status transition
-    is recorded, it cannot be undone programmatically — a human operator
-    must intervene to correct a mistake.
+    requests). Once a status transition is recorded it cannot be undone
+    programmatically — a human operator must intervene to correct a mistake.
 
     TrueForge gate: This tool MUST be placed behind a human-approval step
     in the TrueForge pipeline. The agent must not call it speculatively
     or as part of information-gathering; it is only appropriate after the
     agent has assessed the evidence and committed to a course of action.
 
+    State machine
+    -------------
+    Transitions are validated against the incident's current status.
+    Attempting an action that is not valid from the current status returns
+    an error without modifying any data. Valid paths:
+
+      OPEN               → CREATE_INCIDENT / REQUEST_ON_SITE_CONFIRMATION
+                           → INVESTIGATING
+      INVESTIGATING      → DISPATCH_RESOURCE → RESPONSE_IN_PROGRESS
+                         → ESCALATE          → PENDING_APPROVAL
+                         → REQUEST_ON_SITE_CONFIRMATION (stays INVESTIGATING)
+      PENDING_APPROVAL   → DISPATCH_RESOURCE → RESPONSE_IN_PROGRESS
+      RESPONSE_IN_PROGRESS → ESCALATE        → PENDING_APPROVAL
+                           → DISPATCH_RESOURCE (stays RESPONSE_IN_PROGRESS)
+      RESOLVED           → (terminal; no actions permitted)
+
+    Every call appends a row to incident_audit_log so the full action history
+    is preserved even when action_taken/target on the incident row are later
+    overwritten by a subsequent action.
+
     Parameters
     ----------
     incident_id : str
         UUID of the incident to act upon. The incident must already exist.
-        Use search_reports + manual analysis to identify the correct incident
-        before calling this tool.
+        Use search_reports + analysis to identify the correct incident.
 
     action : str
-        One of the following (case-sensitive):
-          CREATE_INCIDENT
-              Marks a newly formed incident as INVESTIGATING.
-              Use when correlated reports clearly describe a new real event.
-          DISPATCH_RESOURCE
-              Records that a response unit has been dispatched. Sets status
-              to RESPONSE_IN_PROGRESS. Use `target` to record the unit_id
-              returned by check_response_resources.
-          ESCALATE
-              Flags the incident for supervisor review (PENDING_APPROVAL).
-              Use when severity is HIGH/CRITICAL or when the situation is
-              ambiguous and requires human judgement.
-          REQUEST_ON_SITE_CONFIRMATION
-              Sends a request for a field unit to confirm the incident.
-              Sets status to INVESTIGATING. Use when report credibility is
-              low or conflicting.
+        One of (case-sensitive):
+          CREATE_INCIDENT               – open a new investigation
+          DISPATCH_RESOURCE             – send a response unit
+          ESCALATE                      – flag for supervisor review
+          REQUEST_ON_SITE_CONFIRMATION  – ask a field unit to verify
 
     target : str
-        Context-specific target for the action. Examples:
-          • For DISPATCH_RESOURCE: the unit_id from check_response_resources
-            (e.g. "unit_station_14")
-          • For ESCALATE: the supervisor role/name (e.g. "duty_supervisor")
-          • For REQUEST_ON_SITE_CONFIRMATION: the requesting unit
-          • For CREATE_INCIDENT: brief rationale (e.g. "correlated 8 reports")
+        Context-specific target:
+          • DISPATCH_RESOURCE → unit_id from check_response_resources
+          • ESCALATE          → supervisor role (e.g. "duty_supervisor")
+          • REQUEST_ON_SITE_CONFIRMATION → requesting unit identifier
+          • CREATE_INCIDENT   → brief rationale (e.g. "8 correlated reports")
 
     Returns
     -------
     dict with keys:
-        success     : bool  – True if the update succeeded
-        incident_id : str   – the affected incident UUID
-        action      : str   – the action that was recorded
-        new_status  : str   – the incident's status after the update
-        target      : str   – the target that was recorded
+        success     : bool – True if the update succeeded
+        incident_id : str  – the affected incident UUID
+        action      : str  – the action recorded
+        prev_status : str  – status before the transition
+        new_status  : str  – status after the transition
+        target      : str  – the target recorded
     On failure:
         {"error": "<message>", "incident_id": ..., "action": ...}
     """
-    if action not in _ACTION_STATUS_MAP:
+    valid_actions = {a for transitions in _TRANSITIONS.values() for a in transitions}
+    if action not in valid_actions:
         return {
             "error": (
                 f"Unknown action {action!r}. "
-                f"Valid actions: {list(_ACTION_STATUS_MAP)}"
+                f"Valid actions: {sorted(valid_actions)}"
             ),
             "incident_id": incident_id,
             "action": action,
         }
 
-    new_status = _ACTION_STATUS_MAP[action]
-
     conn = _get_db()
     try:
         with conn.cursor() as cur:
+            # Lock the incident row and read current status atomically.
             cur.execute(
-                """
-                UPDATE incidents
-                SET    status       = %s,
-                       action_taken = %s,
-                       target       = %s,
-                       updated_at   = NOW()
-                WHERE  id = %s
-                RETURNING id
-                """,
-                (new_status, action, target, incident_id),
+                "SELECT status FROM incidents WHERE id = %s FOR UPDATE",
+                (incident_id,),
             )
             row = cur.fetchone()
             if not row:
@@ -517,6 +583,48 @@ def create_incident_action(incident_id: str, action: str, target: str) -> dict:
                     "incident_id": incident_id,
                     "action": action,
                 }
+
+            prev_status = row[0]
+
+            # Validate the transition against the state machine.
+            allowed = _TRANSITIONS.get(prev_status, {})
+            if action not in allowed:
+                return {
+                    "error": (
+                        f"Action {action!r} is not valid when incident status "
+                        f"is {prev_status!r}. "
+                        f"Allowed actions from this state: {sorted(allowed) or ['none']}"
+                    ),
+                    "incident_id": incident_id,
+                    "action": action,
+                    "current_status": prev_status,
+                }
+
+            new_status = allowed[action]
+
+            # Apply the transition.
+            cur.execute(
+                """
+                UPDATE incidents
+                SET    status       = %s,
+                       action_taken = %s,
+                       target       = %s,
+                       updated_at   = NOW()
+                WHERE  id = %s
+                """,
+                (new_status, action, target, incident_id),
+            )
+
+            # Append to the immutable audit log — preserves full history.
+            cur.execute(
+                """
+                INSERT INTO incident_audit_log
+                       (incident_id, action, target, prev_status, new_status)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (incident_id, action, target, prev_status, new_status),
+            )
+
         conn.commit()
     except Exception as exc:
         conn.rollback()
@@ -532,6 +640,7 @@ def create_incident_action(incident_id: str, action: str, target: str) -> dict:
         "success": True,
         "incident_id": incident_id,
         "action": action,
+        "prev_status": prev_status,
         "new_status": new_status,
         "target": target,
     }
