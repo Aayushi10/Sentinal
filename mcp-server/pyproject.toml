@@ -1,0 +1,17 @@
+[project]
+name = "sentinel-mcp"
+version = "0.1.0"
+description = "Sentinel MCP Server"
+readme = "README.md"
+authors = [
+    { name = "J0SAL", email = "joyalmeida321@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.3.0",
+    "psycopg2-binary>=2.9.12",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "uvicorn>=0.34.0",
+]
+
