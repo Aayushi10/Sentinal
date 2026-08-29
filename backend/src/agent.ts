@@ -4,8 +4,8 @@
  * Runs a TrueForge session against "sentinel-prod-v1", streams events,
  * handles `tool.approval_required` pauses, and persists results to the DB.
  *
- * The turn loop does NOT block the HTTP request — it runs in the background
- * after the report is inserted. The frontend polls /incidents for updates.
+ * The turn loop does NOT block HTTP requests — it is queued/run in the background
+ * after a report is inserted. Concurrency is capped to avoid overwhelming TrueForge.
  */
 
 import { TrueForgeApi, isEventDelta, mergeEventDelta } from '@truefoundry/trueforge-sdk';
@@ -13,28 +13,61 @@ import { pool } from './db';
 import { trueforge, AGENT_NAME } from './trueforge';
 
 // ---------------------------------------------------------------------------
-// Types
+// Concurrency Limiter
 // ---------------------------------------------------------------------------
+const MAX_CONCURRENT_SESSIONS = parseInt(process.env.MAX_CONCURRENT_SESSIONS ?? '5', 10);
+let activeSessions = 0;
+const sessionQueue: Array<() => Promise<void>> = [];
 
-/** Subset of `incidents` columns we write during agent processing. */
-interface IncidentApprovalState {
-  incidentId: string;
-  sessionId: string;
-  turnId: string;
-  threadId: string;
-  toolCallId: string;
-  evidence: Record<string, unknown>;
-  recommendation: string;
+/**
+ * Enqueue or execute an agent session with a concurrency cap.
+ */
+export function queueAgentSession(
+  reportId: string,
+  reportText: string,
+  reportLat: number,
+  reportLng: number,
+  category: string,
+): void {
+  const task = async () => {
+    activeSessions++;
+    try {
+      await executeAgentSession(reportId, reportText, reportLat, reportLng, category);
+    } catch (err) {
+      console.error(`[agent] Session failed for report ${reportId}:`, err);
+    } finally {
+      activeSessions--;
+      const next = sessionQueue.shift();
+      if (next) {
+        void next();
+      }
+    }
+  };
+
+  if (activeSessions < MAX_CONCURRENT_SESSIONS) {
+    void task();
+  } else {
+    console.warn(
+      `[agent] Concurrency limit reached (${activeSessions}/${MAX_CONCURRENT_SESSIONS}). Queuing report ${reportId}`,
+    );
+    sessionQueue.push(task);
+  }
 }
+
+// Backward-compatible alias
+export const startAgentSession = queueAgentSession;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+function isValidUuid(id: unknown): id is string {
+  if (typeof id !== 'string') return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
+
 /**
- * Extract a best-effort evidence / recommendation summary from the accumulated
- * model messages seen during the turn, so the UI can show them even when the
- * agent is paused and hasn't written a final message.
+ * Extract agent summary and recommendation from accumulated model messages.
  */
 function extractEvidenceFromEvents(
   events: Map<string, TrueForgeApi.TurnStreamingEvent>,
@@ -45,11 +78,9 @@ function extractEvidenceFromEvents(
     if (evt.type === 'model.message' && evt.threadId === 'main') {
       const content = (evt as TrueForgeApi.ModelMessageEvent).content;
       if (content) {
-        // content is string | ModelMessageEventContentOneItem[]
         if (typeof content === 'string') {
           lastModelContent = content;
         } else {
-          // Concatenate all text parts from the content array
           lastModelContent = content
             .map((part) => ('text' in part ? (part as { text: string }).text : ''))
             .join('');
@@ -58,7 +89,6 @@ function extractEvidenceFromEvents(
     }
   }
 
-  // Try to split a "recommendation:" suffix the agent commonly produces.
   const recMatch = lastModelContent.match(/recommendation[:\s]+(.+)$/is);
   const recommendation = recMatch ? recMatch[1].trim() : lastModelContent.slice(-500);
 
@@ -68,66 +98,175 @@ function extractEvidenceFromEvents(
   };
 }
 
-/**
- * Persist the approval-pending state into the `incidents` row.
- * The incident row was already created by `create_incident_action` inside
- * the MCP server. We only update the TrueForge tracking columns here.
- */
-async function persistApprovalState(state: IncidentApprovalState): Promise<void> {
-  const { incidentId, sessionId, turnId, threadId, toolCallId, evidence, recommendation } = state;
-  await pool.query(
-    `UPDATE incidents
-     SET pending_session_id   = $1,
-         pending_turn_id      = $2,
-         pending_thread_id    = $3,
-         pending_tool_call_id = $4,
-         approval_status      = 'PENDING',
-         evidence             = $5,
-         recommendation       = $6,
-         updated_at           = NOW()
-     WHERE id = $7`,
-    [sessionId, turnId, threadId, toolCallId, JSON.stringify(evidence), recommendation, incidentId],
-  );
+interface ProcessStreamResult {
+  events: Map<string, TrueForgeApi.TurnStreamingEvent>;
+  turnId?: string;
+  hasPendingApproval: boolean;
+  terminalStatus?: string;
 }
 
 /**
- * Clear approval-pending state after the resumed turn completes or is rejected.
- * On rejection, we reset to OPEN/INVESTIGATING so the incident can be re-flagged.
+ * Shared turn stream processor for initial and resumed turns.
+ * Accumulates events, merges deltas, persists pending approvals in `pending_approvals`,
+ * and captures newly generated incident IDs from tool responses.
  */
-async function clearApprovalState(
-  incidentId: string,
-  approvalStatus: 'APPROVED' | 'REJECTED',
-): Promise<void> {
-  await pool.query(
-    `UPDATE incidents
-     SET pending_session_id   = NULL,
-         pending_turn_id      = NULL,
-         pending_thread_id    = NULL,
-         pending_tool_call_id = NULL,
-         approval_status      = $1,
-         updated_at           = NOW()
-         -- deliberately leave evidence + recommendation for the UI to display
-     WHERE id = $2`,
-    [approvalStatus, incidentId],
-  );
+async function processTurnStream(
+  sessionId: string,
+  stream: AsyncIterable<TrueForgeApi.TurnStreamingEvent>,
+  context: { reportId?: string; incidentId?: string },
+): Promise<ProcessStreamResult> {
+  const events = new Map<string, TrueForgeApi.TurnStreamingEvent>();
+  const pendingApprovals: TrueForgeApi.ToolApprovalRequiredEvent[] = [];
+  let turnId: string | undefined;
+  let terminalStatus: string | undefined;
+
+  for await (const event of stream) {
+    if (event.type === 'turn.created') {
+      turnId = (event as TrueForgeApi.TurnCreatedEvent).turnId;
+    }
+
+    if (isEventDelta(event)) {
+      const base = events.get(event.id);
+      if (base) mergeEventDelta(base, event);
+    } else {
+      events.set(event.id, event);
+    }
+
+    // Capture tool responses (e.g. create_incident_action returning new incident_id)
+    if (event.type === 'tool.response') {
+      const toolResp = event as TrueForgeApi.ToolResponseEvent;
+      try {
+        const parsed = JSON.parse(toolResp.content);
+        if (parsed && isValidUuid(parsed.incident_id)) {
+          console.log(`[agent] Captured incident_id ${parsed.incident_id} from tool response`);
+          await pool.query(
+            `UPDATE pending_approvals
+             SET incident_id = $1, updated_at = NOW()
+             WHERE session_id = $2 AND tool_call_id = $3`,
+            [parsed.incident_id, sessionId, toolResp.toolCallId],
+          );
+
+          // If report was passed, ensure the report is linked to the new incident
+          if (context.reportId) {
+            await pool.query(
+              `UPDATE reports SET incident_id = $1 WHERE id = $2 AND incident_id IS NULL`,
+              [parsed.incident_id, context.reportId],
+            );
+          }
+        }
+      } catch {
+        // Non-JSON tool responses are ignored
+      }
+    }
+
+    if (event.type === 'tool.approval_required') {
+      pendingApprovals.push(event as TrueForgeApi.ToolApprovalRequiredEvent);
+    }
+
+    if (event.type === 'turn.done') {
+      const done = event as TrueForgeApi.TurnDoneEvent;
+      terminalStatus = done.state.status;
+      console.log(`[agent] Turn completed with status: ${terminalStatus}`);
+    }
+  }
+
+  // Persist pending approvals to the dedicated pending_approvals table
+  if (pendingApprovals.length > 0 && turnId) {
+    const { evidence, recommendation } = extractEvidenceFromEvents(events);
+
+    for (const pending of pendingApprovals) {
+      for (const ref of pending.toolCalls) {
+        const msg = events.get(ref.sourceEventId);
+        if (msg?.type !== 'model.message') continue;
+        const modelMsg = msg as TrueForgeApi.ModelMessageEvent;
+        const call = modelMsg.toolCalls?.find((tc) => tc.id === ref.id);
+        if (!call) continue;
+
+        let callArgs: Record<string, unknown> = {};
+        try {
+          callArgs = JSON.parse(call.function.arguments || '{}');
+        } catch {
+          callArgs = { raw: call.function.arguments };
+        }
+
+        const targetIncidentId =
+          isValidUuid(callArgs.incident_id) ? callArgs.incident_id : context.incidentId ?? null;
+
+        console.log(
+          `[agent] Recording pending approval: ${call.toolInfo.name} action=${callArgs.action} target=${callArgs.target}`,
+        );
+
+        // Store into dedicated pending_approvals table
+        await pool.query(
+          `INSERT INTO pending_approvals (
+             session_id, turn_id, thread_id, tool_call_id,
+             report_id, incident_id, tool_name, action, target,
+             call_args, evidence, recommendation, status
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING')
+           ON CONFLICT (session_id, tool_call_id) DO UPDATE
+           SET turn_id = EXCLUDED.turn_id,
+               call_args = EXCLUDED.call_args,
+               evidence = EXCLUDED.evidence,
+               recommendation = EXCLUDED.recommendation,
+               status = 'PENDING',
+               updated_at = NOW()`,
+          [
+            sessionId,
+            turnId,
+            pending.threadId ?? 'main',
+            ref.id,
+            context.reportId ?? null,
+            targetIncidentId,
+            call.toolInfo.name,
+            callArgs.action ?? null,
+            callArgs.target ?? null,
+            JSON.stringify(callArgs),
+            JSON.stringify(evidence),
+            recommendation,
+          ],
+        );
+
+        // If an existing incident was targeted, sync status on incidents table as well
+        if (targetIncidentId) {
+          await pool.query(
+            `UPDATE incidents
+             SET pending_session_id   = $1,
+                 pending_turn_id      = $2,
+                 pending_thread_id    = $3,
+                 pending_tool_call_id = $4,
+                 approval_status      = 'PENDING',
+                 evidence             = $5,
+                 recommendation       = $6,
+                 updated_at           = NOW()
+             WHERE id = $7`,
+            [
+              sessionId,
+              turnId,
+              pending.threadId ?? 'main',
+              ref.id,
+              JSON.stringify(evidence),
+              recommendation,
+              targetIncidentId,
+            ],
+          );
+        }
+      }
+    }
+  }
+
+  return {
+    events,
+    turnId,
+    hasPendingApproval: pendingApprovals.length > 0,
+    terminalStatus,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Session Execution
 // ---------------------------------------------------------------------------
 
-/**
- * startAgentSession
- * -----------------
- * Opens a new TrueForge session against sentinel-prod-v1, sends the incoming
- * report text as the first user message, streams events until the turn ends
- * (either `done` or paused on `tool.approval_required`), and writes results
- * to the DB.
- *
- * Called in the background after a report is inserted — does NOT await from
- * the HTTP handler.
- */
-export async function startAgentSession(
+async function executeAgentSession(
   reportId: string,
   reportText: string,
   reportLat: number,
@@ -136,215 +275,212 @@ export async function startAgentSession(
 ): Promise<void> {
   console.log(`[agent] Starting session for report ${reportId}`);
 
-  try {
-    // 1. Open a session on the saved agent.
-    const { data: session } = await trueforge.sessions.create({
-      agent: { name: AGENT_NAME },
-    });
-    console.log(`[agent] Session created: ${session.id}`);
+  const { data: session } = await trueforge.sessions.create({
+    agent: { name: AGENT_NAME },
+  });
+  console.log(`[agent] Session created: ${session.id}`);
 
-    // 2. Stream the first turn — the full report context.
-    const userMessage =
-      `New anonymous incident report submitted.\n\n` +
-      `Report ID: ${reportId}\n` +
-      `Category: ${category}\n` +
-      `Coordinates: lat=${reportLat}, lng=${reportLng}\n` +
-      `Description: ${reportText}\n\n` +
-      `Please investigate this report: search for nearby related reports, ` +
-      `assess severity and corroboration, then decide whether to create an incident ` +
-      `and/or dispatch resources. Use create_incident_action for any consequential steps.`;
+  const userMessage =
+    `New anonymous incident report submitted.\n\n` +
+    `Report ID: ${reportId}\n` +
+    `Category: ${category}\n` +
+    `Coordinates: lat=${reportLat}, lng=${reportLng}\n` +
+    `Description: ${reportText}\n\n` +
+    `Please investigate this report: search for nearby related reports, ` +
+    `assess severity and corroboration, then decide whether to create an incident ` +
+    `and/or dispatch resources. Use create_incident_action for any consequential steps.`;
 
-    const events = new Map<string, TrueForgeApi.TurnStreamingEvent>();
-    const pendingApprovals: TrueForgeApi.ToolApprovalRequiredEvent[] = [];
-    let turnId: string | undefined;
+  const stream = await trueforge.sessions.createTurnStream(session.id, {
+    input: [{ type: 'user.message', content: userMessage }],
+  });
 
-    const stream = await trueforge.sessions.createTurnStream(session.id, {
-      input: [{ type: 'user.message', content: userMessage }],
-    });
-
-    for await (const { data: event } of stream.withMetadata()) {
-      if (event.type === 'turn.created') {
-        turnId = (event as TrueForgeApi.TurnCreatedEvent).turnId;
-      }
-
-      if (isEventDelta(event)) {
-        const base = events.get(event.id);
-        if (base) mergeEventDelta(base, event);
-      } else {
-        events.set(event.id, event);
-      }
-
-      if (event.type === 'tool.approval_required') {
-        pendingApprovals.push(event as TrueForgeApi.ToolApprovalRequiredEvent);
-      }
-
-      if (event.type === 'turn.done') {
-        const done = event as TrueForgeApi.TurnDoneEvent;
-        console.log(`[agent] Turn done, status=${done.state.status}`);
-      }
-    }
-
-    // 3. If the turn paused for approval, find the incident the agent created
-    //    and store the pending approval state.
-    if (pendingApprovals.length > 0 && turnId) {
-      const { evidence, recommendation } = extractEvidenceFromEvents(events);
-
-      for (const pending of pendingApprovals) {
-        for (const ref of pending.toolCalls) {
-          const msg = events.get(ref.sourceEventId);
-          if (msg?.type !== 'model.message') continue;
-          const modelMsg = msg as TrueForgeApi.ModelMessageEvent;
-          const call = modelMsg.toolCalls?.find((tc) => tc.id === ref.id);
-          if (!call) continue;
-
-          console.log(
-            `[agent] Tool approval required: ${call.toolInfo.name}(${call.function.arguments})`,
-          );
-
-          // The agent must have called create_incident_action, which creates an
-          // incidents row. Find the most recent PENDING_APPROVAL or INVESTIGATING
-          // incident that has no pending_session_id yet (i.e. just created by the
-          // MCP tool in this session).
-          const { rows } = await pool.query<{ id: string }>(
-            `SELECT id FROM incidents
-             WHERE pending_session_id IS NULL
-               AND status IN ('INVESTIGATING', 'PENDING_APPROVAL', 'OPEN')
-             ORDER BY created_at DESC
-             LIMIT 1`,
-          );
-
-          if (rows.length === 0) {
-            console.warn('[agent] No untracked incident found to attach approval state to');
-            continue;
-          }
-
-          const incidentId = rows[0].id;
-          await persistApprovalState({
-            incidentId,
-            sessionId: session.id,
-            turnId,
-            threadId: pending.threadId ?? 'main',
-            toolCallId: ref.id,
-            evidence,
-            recommendation,
-          });
-
-          console.log(`[agent] Approval state saved for incident ${incidentId}`);
-        }
-      }
-    }
-  } catch (err) {
-    console.error(`[agent] Error in session for report ${reportId}:`, err);
-  }
+  await processTurnStream(session.id, stream, { reportId });
 }
+
+// ---------------------------------------------------------------------------
+// Human-in-the-Loop Resumptions
+// ---------------------------------------------------------------------------
 
 /**
  * approveIncidentAction
  * ---------------------
- * Resumes the paused TrueForge session with `user.tool_approval { status: 'allow' }`.
- * Clears the approval state on the incident after the turn completes.
+ * Atomically transitions approval from PENDING to PROCESSING to prevent duplicate decisions.
+ * Resumes TrueForge turn with allow, streams events, and handles any chained approvals.
  */
-export async function approveIncidentAction(incidentId: string): Promise<void> {
+export async function approveIncidentAction(
+  targetId: string,
+  operator: string = 'operator',
+): Promise<{ success: boolean; message: string }> {
+  // Atomically claim the pending approval
   const { rows } = await pool.query<{
-    pending_session_id: string;
-    pending_thread_id: string;
-    pending_tool_call_id: string;
+    id: string;
+    session_id: string;
+    thread_id: string;
+    tool_call_id: string;
+    incident_id: string | null;
   }>(
-    `SELECT pending_session_id, pending_thread_id, pending_tool_call_id
-     FROM incidents WHERE id = $1`,
-    [incidentId],
+    `UPDATE pending_approvals
+     SET status = 'PROCESSING', operator = $2, updated_at = NOW()
+     WHERE (id::text = $1 OR incident_id::text = $1)
+       AND status = 'PENDING'
+     RETURNING id, session_id, thread_id, tool_call_id, incident_id`,
+    [targetId, operator],
   );
 
-  if (rows.length === 0) throw new Error(`Incident ${incidentId} not found`);
-  const { pending_session_id, pending_thread_id, pending_tool_call_id } = rows[0];
-
-  if (!pending_session_id || !pending_tool_call_id) {
-    throw new Error(`Incident ${incidentId} has no pending approval`);
+  if (rows.length === 0) {
+    throw new Error('No pending approval found (may already be approved or processing)');
   }
 
-  console.log(`[agent] Resuming session ${pending_session_id} with ALLOW`);
+  const approval = rows[0];
+  const incidentId = approval.incident_id;
 
-  const approvalInput: TrueForgeApi.UserToolApprovalEvent[] = [
-    {
-      type: 'user.tool_approval',
-      threadId: pending_thread_id ?? 'main',
-      toolCallId: pending_tool_call_id,
-      approval: { status: 'allow' },
-    },
-  ];
+  console.log(`[agent] Operator ${operator} approved tool call ${approval.tool_call_id}`);
 
-  const resume = await trueforge.sessions.createTurnStream(pending_session_id, {
-    input: approvalInput,
-  });
+  try {
+    const approvalInput: TrueForgeApi.UserToolApprovalEvent[] = [
+      {
+        type: 'user.tool_approval',
+        threadId: approval.thread_id ?? 'main',
+        toolCallId: approval.tool_call_id,
+        approval: { status: 'allow' },
+      },
+    ];
 
-  for await (const { data: event } of resume.withMetadata()) {
-    if (event.type === 'turn.done') {
-      console.log(`[agent] Resume turn done for incident ${incidentId}`);
+    const stream = await trueforge.sessions.createTurnStream(approval.session_id, {
+      input: approvalInput,
+    });
+
+    const result = await processTurnStream(approval.session_id, stream, {
+      incidentId: incidentId ?? undefined,
+    });
+
+    if (result.hasPendingApproval) {
+      console.log(`[agent] Resumed turn triggered another approval gate`);
+    } else if (result.terminalStatus === 'error' || result.terminalStatus === 'cancelled') {
+      await pool.query(
+        `UPDATE pending_approvals SET status = 'FAILED', updated_at = NOW() WHERE id = $1`,
+        [approval.id],
+      );
+      throw new Error(`Agent turn terminated with status: ${result.terminalStatus}`);
+    } else {
+      await pool.query(
+        `UPDATE pending_approvals SET status = 'APPROVED', updated_at = NOW() WHERE id = $1`,
+        [approval.id],
+      );
+
+      if (incidentId) {
+        await pool.query(
+          `UPDATE incidents
+           SET approval_status = 'APPROVED',
+               pending_session_id = NULL,
+               pending_turn_id = NULL,
+               pending_thread_id = NULL,
+               pending_tool_call_id = NULL,
+               updated_at = NOW()
+           WHERE id = $1`,
+          [incidentId],
+        );
+      }
     }
-  }
 
-  await clearApprovalState(incidentId, 'APPROVED');
+    return { success: true, message: 'Approval processed successfully' };
+  } catch (err) {
+    // Rollback to PENDING on connection / SDK error so operator can retry
+    await pool.query(
+      `UPDATE pending_approvals SET status = 'PENDING', updated_at = NOW() WHERE id = $1`,
+      [approval.id],
+    );
+    throw err;
+  }
 }
 
 /**
  * rejectIncidentAction
  * --------------------
- * Resumes the paused TrueForge session with `user.tool_approval { status: 'deny' }`.
- * The incident is reset to OPEN/INVESTIGATING (not closed) so it can be re-flagged.
+ * Atomically transitions approval from PENDING to PROCESSING.
+ * Resumes TrueForge turn with deny, and marks incident status as INVESTIGATING.
  */
 export async function rejectIncidentAction(
-  incidentId: string,
+  targetId: string,
   reason: string,
-): Promise<void> {
+  operator: string = 'operator',
+): Promise<{ success: boolean; message: string }> {
+  // Atomically claim the pending approval
   const { rows } = await pool.query<{
-    pending_session_id: string;
-    pending_thread_id: string;
-    pending_tool_call_id: string;
+    id: string;
+    session_id: string;
+    thread_id: string;
+    tool_call_id: string;
+    incident_id: string | null;
   }>(
-    `SELECT pending_session_id, pending_thread_id, pending_tool_call_id
-     FROM incidents WHERE id = $1`,
-    [incidentId],
+    `UPDATE pending_approvals
+     SET status = 'PROCESSING', operator = $2, updated_at = NOW()
+     WHERE (id::text = $1 OR incident_id::text = $1)
+       AND status = 'PENDING'
+     RETURNING id, session_id, thread_id, tool_call_id, incident_id`,
+    [targetId, operator],
   );
 
-  if (rows.length === 0) throw new Error(`Incident ${incidentId} not found`);
-  const { pending_session_id, pending_thread_id, pending_tool_call_id } = rows[0];
-
-  if (!pending_session_id || !pending_tool_call_id) {
-    throw new Error(`Incident ${incidentId} has no pending approval`);
+  if (rows.length === 0) {
+    throw new Error('No pending approval found (may already be rejected or processing)');
   }
 
-  console.log(`[agent] Resuming session ${pending_session_id} with DENY: ${reason}`);
+  const approval = rows[0];
+  const incidentId = approval.incident_id;
 
-  const denyInput: TrueForgeApi.UserToolApprovalEvent[] = [
-    {
-      type: 'user.tool_approval',
-      threadId: pending_thread_id ?? 'main',
-      toolCallId: pending_tool_call_id,
-      approval: { status: 'deny', reason },
-    },
-  ];
+  console.log(`[agent] Operator ${operator} rejected tool call ${approval.tool_call_id}: ${reason}`);
 
-  const resume = await trueforge.sessions.createTurnStream(pending_session_id, {
-    input: denyInput,
-  });
+  try {
+    const denyInput: TrueForgeApi.UserToolApprovalEvent[] = [
+      {
+        type: 'user.tool_approval',
+        threadId: approval.thread_id ?? 'main',
+        toolCallId: approval.tool_call_id,
+        approval: { status: 'deny', reason },
+      },
+    ];
 
-  for await (const { data: event } of resume.withMetadata()) {
-    if (event.type === 'turn.done') {
-      console.log(`[agent] Deny turn done for incident ${incidentId}`);
+    const stream = await trueforge.sessions.createTurnStream(approval.session_id, {
+      input: denyInput,
+    });
+
+    await processTurnStream(approval.session_id, stream, {
+      incidentId: incidentId ?? undefined,
+    });
+
+    await pool.query(
+      `UPDATE pending_approvals SET status = 'REJECTED', updated_at = NOW() WHERE id = $1`,
+      [approval.id],
+    );
+
+    if (incidentId) {
+      await pool.query(
+        `UPDATE incidents
+         SET status = 'INVESTIGATING',
+             approval_status = 'REJECTED',
+             pending_session_id = NULL,
+             pending_turn_id = NULL,
+             pending_thread_id = NULL,
+             pending_tool_call_id = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [incidentId],
+      );
+
+      // Audit log entry for rejection
+      await pool.query(
+        `INSERT INTO incident_audit_log (incident_id, action, target, prev_status, new_status)
+         VALUES ($1, 'OPERATOR_REJECTED', $2, 'PENDING_APPROVAL', 'INVESTIGATING')`,
+        [incidentId, `Rejected by ${operator}: ${reason}`],
+      );
     }
-  }
 
-  // Reset to INVESTIGATING — per design, rejection does NOT close the incident.
-  await pool.query(
-    `UPDATE incidents
-     SET status       = 'INVESTIGATING',
-         approval_status = 'REJECTED',
-         pending_session_id   = NULL,
-         pending_turn_id      = NULL,
-         pending_thread_id    = NULL,
-         pending_tool_call_id = NULL,
-         updated_at   = NOW()
-     WHERE id = $1`,
-    [incidentId],
-  );
+    return { success: true, message: 'Rejection processed; incident kept in INVESTIGATING' };
+  } catch (err) {
+    await pool.query(
+      `UPDATE pending_approvals SET status = 'PENDING', updated_at = NOW() WHERE id = $1`,
+      [approval.id],
+    );
+    throw err;
+  }
 }
