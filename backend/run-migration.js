@@ -18,16 +18,18 @@ if (!DATABASE_URL) {
 const pool = new Pool({ connectionString: DATABASE_URL });
 
 async function main() {
-  const sql = fs.readFileSync(
-    path.join(__dirname, 'src', 'migrations', 'add_approval_state.sql'),
-    'utf8',
-  );
-  
+  const migrationsDir = path.join(__dirname, 'src', 'migrations');
+  const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith('.sql')).sort();
+
   const client = await pool.connect();
   try {
-    console.log('Running migration: add_approval_state.sql ...');
-    await client.query(sql);
-    console.log('Migration complete.');
+    for (const file of files) {
+      console.log(`Running migration: ${file} ...`);
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      await client.query(sql);
+      console.log(`✓ ${file} applied.`);
+    }
+    console.log('All migrations complete.');
   } finally {
     client.release();
     await pool.end();
