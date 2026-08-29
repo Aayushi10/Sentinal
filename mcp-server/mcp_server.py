@@ -468,6 +468,12 @@ def check_response_resources(incident_type: str, lat: float, lng: float) -> dict
 # transitioning an existing one, so it intentionally does not appear here.
 _TRANSITIONS: dict[str, dict[str, str]] = {
     #                       action                 → new_status
+    # OPEN is the schema default; incidents inserted directly (e.g. via API)
+    # start here and must be transitioned before resources are dispatched.
+    "OPEN": {
+        "REQUEST_ON_SITE_CONFIRMATION":  "INVESTIGATING",
+        "ESCALATE":                      "PENDING_APPROVAL",
+    },
     "INVESTIGATING": {
         "DISPATCH_RESOURCE":             "RESPONSE_IN_PROGRESS",
         "ESCALATE":                      "PENDING_APPROVAL",
@@ -604,17 +610,30 @@ def create_incident_action(
                 new_id = str(cur.fetchone()[0])
 
                 # Optionally link reports to the new incident atomically.
+                # Only claims reports that are currently unassigned (incident_id IS NULL).
+                # If any requested report is already owned by another incident,
+                # the whole transaction is rolled back to prevent silent theft.
                 reports_linked = 0
                 if report_ids:
+                    unique_ids = list(set(report_ids))  # deduplicate
                     cur.execute(
                         """
                         UPDATE reports
                         SET    incident_id = %s
                         WHERE  id = ANY(%s)
+                          AND  incident_id IS NULL
                         """,
-                        (new_id, report_ids),
+                        (new_id, unique_ids),
                     )
                     reports_linked = cur.rowcount
+                    if reports_linked != len(unique_ids):
+                        # At least one report was already assigned; roll back
+                        # and surface a clear error instead of partial success.
+                        raise ValueError(
+                            f"{len(unique_ids) - reports_linked} of the requested "
+                            f"report(s) are already assigned to another incident. "
+                            f"Re-run search_reports to get current assignments."
+                        )
 
                 # Audit log entry for the creation.
                 cur.execute(
