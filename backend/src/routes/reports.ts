@@ -2,59 +2,107 @@
  * routes/reports.ts
  * -----------------
  * POST /reports        — submit a new report, insert to DB, fire agent async
- * GET  /reports        — list all reports (newest-first)
+ * GET  /reports        — list all reports (newest-first, public projection)
  * GET  /reports/:id    — get one report by UUID
  */
 
 import { Router, Request, Response, IRouter } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { pool } from '../db';
-import { startAgentSession } from '../agent';
+import { queueAgentSession } from '../agent';
 
 const router: IRouter = Router();
+
+const ALLOWED_CATEGORIES = ['fire', 'crime', 'hazard', 'other'] as const;
+type ReportCategory = (typeof ALLOWED_CATEGORIES)[number];
+
+// Simple in-memory sliding-window rate limiter per client IP (30 requests/minute)
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const MAX_REPORTS_PER_WINDOW = 30;
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+
+  if (entry.count >= MAX_REPORTS_PER_WINDOW) {
+    return false;
+  }
+
+  entry.count++;
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // POST /reports
 // ---------------------------------------------------------------------------
 router.post('/', async (req: Request, res: Response): Promise<void> => {
-  const { text, lat, lng, category, reporter_id } = req.body as {
-    text?: string;
-    lat?: number;
-    lng?: number;
-    category?: string;
-    reporter_id?: string;
-  };
-
-  if (!text || lat == null || lng == null) {
-    res.status(400).json({ error: 'text, lat, and lng are required' });
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(clientIp)) {
+    res.status(429).json({ error: 'Too many reports submitted. Please wait before submitting again.' });
     return;
   }
 
-  const reporterIdFinal = reporter_id ?? uuidv4();
-  const categoryFinal = category ?? 'other';
+  const { text, lat, lng, category } = req.body as {
+    text?: unknown;
+    lat?: unknown;
+    lng?: unknown;
+    category?: unknown;
+  };
+
+  // 1. Text validation: non-blank string, length bounded
+  if (typeof text !== 'string' || text.trim().length < 3 || text.trim().length > 2000) {
+    res.status(400).json({ error: 'text is required and must be between 3 and 2000 characters' });
+    return;
+  }
+  const cleanText = text.trim();
+
+  // 2. Latitude validation: finite number [-90, 90]
+  if (typeof lat !== 'number' || !Number.isFinite(lat) || lat < -90 || lat > 90) {
+    res.status(400).json({ error: 'lat is required and must be a valid latitude between -90 and 90' });
+    return;
+  }
+
+  // 3. Longitude validation: finite number [-180, 180]
+  if (typeof lng !== 'number' || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+    res.status(400).json({ error: 'lng is required and must be a valid longitude between -180 and 180' });
+    return;
+  }
+
+  // 4. Category validation
+  let categoryFinal: ReportCategory = 'other';
+  if (typeof category === 'string' && ALLOWED_CATEGORIES.includes(category.toLowerCase() as ReportCategory)) {
+    categoryFinal = category.toLowerCase() as ReportCategory;
+  }
+
+  // Server-generated anonymous reporter ID (not client controlled)
+  const reporterIdFinal = uuidv4();
 
   try {
     const { rows } = await pool.query<{ id: string; timestamp: Date }>(
       `INSERT INTO reports (text, lat, lng, category, reporter_id)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING id, timestamp`,
-      [text, lat, lng, categoryFinal, reporterIdFinal],
+      [cleanText, lat, lng, categoryFinal, reporterIdFinal],
     );
     const report = rows[0];
 
-    // Fire agent session in the background — do NOT await.
-    startAgentSession(report.id, text, lat, lng, categoryFinal).catch((err) => {
-      console.error('[routes/reports] Background agent session failed:', err);
-    });
+    // Enqueue agent session asynchronously — does NOT await
+    queueAgentSession(report.id, cleanText, lat, lng, categoryFinal);
 
+    // Omit sensitive reporter_id from the public response
     res.status(201).json({
       id: report.id,
-      text,
+      text: cleanText,
       lat,
       lng,
       category: categoryFinal,
       timestamp: report.timestamp,
-      reporter_id: reporterIdFinal,
       incident_id: null,
     });
   } catch (err) {
@@ -68,8 +116,9 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
 // ---------------------------------------------------------------------------
 router.get('/', async (_req: Request, res: Response): Promise<void> => {
   try {
+    // Project only public fields — reporter_id is stripped for privacy
     const { rows } = await pool.query(
-      `SELECT id, text, lat, lng, category, timestamp, reporter_id, incident_id
+      `SELECT id, text, lat, lng, category, timestamp, incident_id
        FROM reports
        ORDER BY timestamp DESC
        LIMIT 200`,
@@ -88,7 +137,7 @@ router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   try {
     const { rows } = await pool.query(
-      `SELECT id, text, lat, lng, category, timestamp, reporter_id, incident_id
+      `SELECT id, text, lat, lng, category, timestamp, incident_id
        FROM reports WHERE id = $1`,
       [id],
     );
