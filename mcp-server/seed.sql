@@ -1,19 +1,29 @@
 -- ============================================================
--- Sentinel – seed data
+-- Sentinel – seed data  (IDEMPOTENT — safe to re-run)
 -- Apply AFTER schema.sql:
 --   psql $DATABASE_URL -f seed.sql
 --
 -- Scenario:
---   • 12 reports clustered around 37.7749° N, 122.4194° W
+--   • 12 reports clustered around 37.7796° N, 122.4194° W
 --     (downtown San Francisco, near Civic Center) — simulating
 --     a building-fire event reported from multiple witnesses.
 --   • 4 unrelated, scattered reports elsewhere in the city.
 --
 -- All timestamps are within the last 40 minutes so they fall
 -- inside the default since_minutes=45 window of search_reports.
+--
+-- Idempotency strategy:
+--   • Wrapped in a transaction with stop-on-error (default psql behaviour
+--     with \set ON_ERROR_STOP on).
+--   • The seeded incident uses a fixed UUID + ON CONFLICT DO NOTHING.
+--   • Seeded reports use fixed reporter_ids; the DELETE before INSERT
+--     removes only seed rows (identified by reporter_id prefix 'reporter-00')
+--     so real data is never touched.
 -- ============================================================
 
--- First create a test incident to attach some clustered reports to.
+BEGIN;
+
+-- ---- Seeded incident (fixed UUID, idempotent) ----------------------------
 INSERT INTO incidents (id, status, severity, confidence, centroid_lat, centroid_lng)
 VALUES (
     'aaaaaaaa-0000-0000-0000-000000000001',
@@ -22,7 +32,13 @@ VALUES (
     'HIGH',
     37.7796,
     -122.4194
-);
+)
+ON CONFLICT (id) DO NOTHING;
+
+-- ---- Remove existing seed reports to avoid duplicates on re-run ----------
+-- Only touches rows with reporter_ids that belong to this seed script.
+DELETE FROM reports
+WHERE reporter_id LIKE 'reporter-00%';
 
 -- ---- Building-fire cluster (within ~300 m of Civic Center) ---------------
 INSERT INTO reports (text, lat, lng, category, timestamp, reporter_id, incident_id)
@@ -143,3 +159,5 @@ VALUES
     'reporter-0016',
     NULL
 );
+
+COMMIT;

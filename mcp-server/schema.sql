@@ -2,6 +2,7 @@
 -- Sentinel – database schema
 -- Apply to Supabase via the SQL Editor or psql:
 --   psql $DATABASE_URL -f schema.sql
+-- (safe to re-run — all statements are idempotent)
 -- ============================================================
 
 -- PostGIS must be enabled before geography columns / functions are used.
@@ -54,6 +55,25 @@ DROP TRIGGER IF EXISTS incidents_updated_at ON incidents;
 CREATE TRIGGER incidents_updated_at
     BEFORE UPDATE ON incidents
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- ------------------------------------------------------------
+-- incident_audit_log
+-- Append-only record of every action taken on an incident.
+-- Fixes: actions were previously overwritten on each call to
+-- create_incident_action, losing the history of what happened.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS incident_audit_log (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id   UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    action        TEXT NOT NULL,
+    target        TEXT,
+    prev_status   TEXT,          -- status before the transition
+    new_status    TEXT,          -- status after the transition
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS audit_log_incident_idx
+    ON incident_audit_log (incident_id, created_at DESC);
 
 -- ------------------------------------------------------------
 -- reports
