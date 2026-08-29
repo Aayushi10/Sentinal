@@ -22,9 +22,25 @@ const app: Express = express();
 const PORT = parseInt(process.env.PORT ?? '3001', 10);
 
 // ---------------------------------------------------------------------------
-// Middleware
+// CORS Middleware (restricted origins with safe defaults)
 // ---------------------------------------------------------------------------
-app.use(cors());
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim())
+  : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8080'];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+      if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      callback(new Error(`CORS error: Origin ${origin} not allowed`));
+    },
+    credentials: true,
+  }),
+);
+
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
@@ -50,11 +66,11 @@ app.get('/status', async (_req, res) => {
       latest_incident_at: string | null;
     }>(`
       SELECT
-        (SELECT COUNT(*) FROM reports)          AS total_reports,
-        (SELECT COUNT(*) FROM incidents)        AS total_incidents,
-        (SELECT COUNT(*) FROM incidents
-          WHERE approval_status = 'PENDING')    AS pending_approvals,
-        (SELECT MAX(created_at) FROM incidents) AS latest_incident_at
+        (SELECT COUNT(*) FROM reports)                     AS total_reports,
+        (SELECT COUNT(*) FROM incidents)                   AS total_incidents,
+        (SELECT COUNT(*) FROM pending_approvals
+          WHERE status = 'PENDING')                        AS pending_approvals,
+        (SELECT MAX(created_at) FROM incidents)            AS latest_incident_at
     `);
     res.json(rows[0]);
   } catch (err) {
