@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Sentinel incident-correlation backend — Express/TypeScript service using TrueForge SDK",
   "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

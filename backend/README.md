@@ -14,7 +14,8 @@ Node/TypeScript Express service that:
 
 | Requirement | Notes |
 |---|---|
-| Node.js ≥ 18 | Tested with 20 LTS |
+| Node.js ≥ 22 | Required by `@truefoundry/trueforge-sdk` |
+| pnpm ≥ 11 | Package manager |
 | Supabase database | PostGIS enabled; `schema.sql` applied (see `mcp-server/`) |
 | TrueForge running locally | Default `http://localhost:8790` — start with `npx @truefoundry/trueforge` |
 | Agent `sentinel-prod-v1` saved in TrueForge | Created via the TrueForge UI/CLI with the MCP server attached |
@@ -23,24 +24,27 @@ Node/TypeScript Express service that:
 
 ## Environment Variables
 
-Create `backend/.env` (already pre-populated with the project defaults):
+Create `backend/.env` (see `.env.example`):
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DATABASE_URL` | ✅ | — | PostgreSQL connection string (same DB as `mcp-server/`) |
 | `TRUEFORGE_BASE_URL` | | `http://localhost:8790` | URL of the running TrueForge server |
 | `PORT` | | `3001` | Port the Express server listens on |
+| `CORS_ORIGIN` | | `http://localhost:3000,http://localhost:5173` | Allowed frontend origins |
+| `OPERATOR_API_KEY` | | — | Optional secret required for `/approve` and `/reject` |
+| `MAX_CONCURRENT_SESSIONS` | | `5` | Concurrency cap for background TrueForge sessions |
 
 ---
 
 ## Setup
 
-### 1. Run the DB migration
+### 1. Run the DB migrations
 
-Add the TrueForge session-tracking columns to `incidents`:
+Run the automated migration runner (applies all files in `src/migrations/`):
 
 ```bash
-psql $DATABASE_URL -f backend/src/migrations/add_approval_state.sql
+node run-migration.js
 ```
 
 This is idempotent — safe to re-run.
