@@ -749,4 +749,17 @@ def create_incident_action(
 if __name__ == "__main__":
     # Default transport is stdio, which is what TrueForge and MCP Inspector
     # expect. Run with: uv run mcp_server.py
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+
+    if transport == "http":
+        # HTTP transport — exposes the server at http://<host>:<port>/mcp
+        # Required when connecting to TrueForge (which needs a URL endpoint).
+        # Set MCP_HOST / MCP_PORT in .env to override defaults.
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("PORT", os.environ.get("MCP_PORT", "8000")))
+        print(f"Starting Sentinel MCP server (HTTP) at http://{host}:{port}/mcp")
+        mcp.run(transport="streamable-http", host=host, port=port, path="/mcp")
+    else:
+        # stdio transport — used by MCP Inspector and direct CLI invocations.
+        # Run with: uv run mcp_server.py
+        mcp.run(transport="stdio")
