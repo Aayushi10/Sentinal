@@ -463,15 +463,11 @@ def check_response_resources(incident_type: str, lat: float, lng: float) -> dict
 # Tool 5 – create_incident_action (SIDE-EFFECTING — HUMAN APPROVAL REQUIRED)
 # ---------------------------------------------------------------------------
 
-# Allowed status transitions: {current_status: [allowed_actions]}
-# This enforces a one-way state machine — an incident cannot regress to an
-# earlier state or repeat a transition it has already completed.
+# Allowed status transitions for actions on EXISTING incidents.
+# CREATE_INCIDENT is handled separately — it INSERTs a new row rather than
+# transitioning an existing one, so it intentionally does not appear here.
 _TRANSITIONS: dict[str, dict[str, str]] = {
     #                       action                 → new_status
-    "OPEN": {
-        "CREATE_INCIDENT":               "INVESTIGATING",
-        "REQUEST_ON_SITE_CONFIRMATION":  "INVESTIGATING",
-    },
     "INVESTIGATING": {
         "DISPATCH_RESOURCE":             "RESPONSE_IN_PROGRESS",
         "ESCALATE":                      "PENDING_APPROVAL",
@@ -490,9 +486,14 @@ _TRANSITIONS: dict[str, dict[str, str]] = {
 
 
 @mcp.tool()
-def create_incident_action(incident_id: str, action: str, target: str) -> dict:
+def create_incident_action(
+    incident_id: str,
+    action: str,
+    target: str,
+    report_ids: list[str] | None = None,
+) -> dict:
     """
-    Execute a consequential action on an incident record.
+    Execute a consequential action on an incident.
 
     ⚠️  SIDE-EFFECTING — REQUIRES HUMAN APPROVAL ⚠️
     This tool writes to the database and may trigger real-world responses
@@ -505,14 +506,18 @@ def create_incident_action(incident_id: str, action: str, target: str) -> dict:
     or as part of information-gathering; it is only appropriate after the
     agent has assessed the evidence and committed to a course of action.
 
-    State machine
-    -------------
-    Transitions are validated against the incident's current status.
-    Attempting an action that is not valid from the current status returns
-    an error without modifying any data. Valid paths:
+    CREATE_INCIDENT vs. other actions
+    ----------------------------------
+    CREATE_INCIDENT is special: it INSERTs a brand-new incident row and
+    returns the generated incident_id. The `incident_id` parameter is
+    IGNORED for this action — pass an empty string ("").
 
-      OPEN               → CREATE_INCIDENT / REQUEST_ON_SITE_CONFIRMATION
-                           → INVESTIGATING
+    All other actions (DISPATCH_RESOURCE, ESCALATE,
+    REQUEST_ON_SITE_CONFIRMATION) require an existing incident_id and are
+    validated against the state machine below.
+
+    State machine (existing incidents)
+    ------------------------------------
       INVESTIGATING      → DISPATCH_RESOURCE → RESPONSE_IN_PROGRESS
                          → ESCALATE          → PENDING_APPROVAL
                          → REQUEST_ON_SITE_CONFIRMATION (stays INVESTIGATING)
@@ -521,34 +526,45 @@ def create_incident_action(incident_id: str, action: str, target: str) -> dict:
                            → DISPATCH_RESOURCE (stays RESPONSE_IN_PROGRESS)
       RESOLVED           → (terminal; no actions permitted)
 
-    Every call appends a row to incident_audit_log so the full action history
-    is preserved even when action_taken/target on the incident row are later
-    overwritten by a subsequent action.
+    Every call appends a row to incident_audit_log so the full action
+    history is preserved.
 
     Parameters
     ----------
     incident_id : str
-        UUID of the incident to act upon. The incident must already exist.
-        Use search_reports + analysis to identify the correct incident.
+        For CREATE_INCIDENT: ignored — pass "". The new UUID is returned.
+        For all other actions: UUID of the existing incident to act upon.
 
     action : str
         One of (case-sensitive):
-          CREATE_INCIDENT               – open a new investigation
+          CREATE_INCIDENT               – creates a new incident (INSERT)
           DISPATCH_RESOURCE             – send a response unit
           ESCALATE                      – flag for supervisor review
           REQUEST_ON_SITE_CONFIRMATION  – ask a field unit to verify
 
     target : str
-        Context-specific target:
+        Context-specific payload:
+          • CREATE_INCIDENT   → brief rationale (e.g. "12 correlated reports")
           • DISPATCH_RESOURCE → unit_id from check_response_resources
           • ESCALATE          → supervisor role (e.g. "duty_supervisor")
           • REQUEST_ON_SITE_CONFIRMATION → requesting unit identifier
-          • CREATE_INCIDENT   → brief rationale (e.g. "8 correlated reports")
+
+    report_ids : list[str] | None, default None
+        For CREATE_INCIDENT only: list of report UUIDs (from search_reports)
+        to attach to the new incident in the same transaction. Their
+        incident_id foreign key is updated atomically. Ignored for other
+        actions.
 
     Returns
     -------
-    dict with keys:
-        success     : bool – True if the update succeeded
+    For CREATE_INCIDENT:
+        success     : bool – True
+        incident_id : str  – UUID of the newly created incident
+        action      : "CREATE_INCIDENT"
+        new_status  : "INVESTIGATING"
+        reports_linked : int – number of reports attached
+    For other actions:
+        success     : bool – True
         incident_id : str  – the affected incident UUID
         action      : str  – the action recorded
         prev_status : str  – status before the transition
@@ -557,17 +573,78 @@ def create_incident_action(incident_id: str, action: str, target: str) -> dict:
     On failure:
         {"error": "<message>", "incident_id": ..., "action": ...}
     """
-    valid_actions = {a for transitions in _TRANSITIONS.values() for a in transitions}
-    if action not in valid_actions:
+    _ALL_ACTIONS = {"CREATE_INCIDENT", "DISPATCH_RESOURCE", "ESCALATE",
+                    "REQUEST_ON_SITE_CONFIRMATION"}
+    if action not in _ALL_ACTIONS:
         return {
             "error": (
                 f"Unknown action {action!r}. "
-                f"Valid actions: {sorted(valid_actions)}"
+                f"Valid actions: {sorted(_ALL_ACTIONS)}"
             ),
             "incident_id": incident_id,
             "action": action,
         }
 
+    # ------------------------------------------------------------------
+    # CREATE_INCIDENT — INSERT a brand-new incident row.
+    # This is the only action that does not require an existing incident.
+    # ------------------------------------------------------------------
+    if action == "CREATE_INCIDENT":
+        conn = _get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO incidents (status, action_taken, target)
+                    VALUES ('INVESTIGATING', 'CREATE_INCIDENT', %s)
+                    RETURNING id
+                    """,
+                    (target,),
+                )
+                new_id = str(cur.fetchone()[0])
+
+                # Optionally link reports to the new incident atomically.
+                reports_linked = 0
+                if report_ids:
+                    cur.execute(
+                        """
+                        UPDATE reports
+                        SET    incident_id = %s
+                        WHERE  id = ANY(%s)
+                        """,
+                        (new_id, report_ids),
+                    )
+                    reports_linked = cur.rowcount
+
+                # Audit log entry for the creation.
+                cur.execute(
+                    """
+                    INSERT INTO incident_audit_log
+                           (incident_id, action, target, prev_status, new_status)
+                    VALUES (%s, 'CREATE_INCIDENT', %s, NULL, 'INVESTIGATING')
+                    """,
+                    (new_id, target),
+                )
+
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            return {"error": f"Database error: {exc}", "action": action}
+        finally:
+            conn.close()
+
+        return {
+            "success": True,
+            "incident_id": new_id,
+            "action": "CREATE_INCIDENT",
+            "new_status": "INVESTIGATING",
+            "target": target,
+            "reports_linked": reports_linked,
+        }
+
+    # ------------------------------------------------------------------
+    # All other actions — validate transition and UPDATE existing incident.
+    # ------------------------------------------------------------------
     conn = _get_db()
     try:
         with conn.cursor() as cur:
