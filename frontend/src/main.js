@@ -31,7 +31,12 @@ const state = {
   cursorCoords: { lat: 37.7796, lng: -122.4194 },
   mapTheme: 'black', // 'black' | 'satellite'
   activeSignalId: null,
+  decisionInProgress: false,
 };
+
+// Selection race-condition tokens
+let currentSelectToken = 0;
+let selectAbortController = null;
 
 // ─────────────────────────────────────────────────────────────────
 // Leaflet Map & "Incident Field" Layer Management
@@ -697,8 +702,6 @@ function updateMapHUD() {
   const hudEl = document.getElementById('map-hud');
   if (!hudEl) return;
 
-  const latStr = state.cursorCoords.lat.toFixed(4);
-  const lngStr = state.cursorCoords.lng.toFixed(4);
   const isBlack = state.mapTheme === 'black';
 
   hudEl.innerHTML = `
@@ -715,7 +718,7 @@ function updateMapHUD() {
     </div>
 
     <div class="hud-pill">
-      <span>GRID: <strong>${latStr}°N, ${lngStr}°W</strong></span>
+      <span>GRID: <strong>${fmtCoords(state.cursorCoords.lat, state.cursorCoords.lng)}</strong></span>
     </div>
   `;
 
@@ -782,7 +785,15 @@ function renderDetailDrawer() {
   const evidenceSummary = inc.active_approval?.evidence || inc.evidence || 'Multiple correlated public signals confirm structural emergency with high convergence.';
 
   // Chronological reports for Evidence Convergence Timeline (oldest to newest)
-  const sortedReports = inc.reports ? [...inc.reports].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp)) : [];
+  const validReports = (inc.reports || [])
+    .map((r) => ({
+      ...r,
+      _timeMs: r.timestamp ? new Date(r.timestamp).getTime() : NaN,
+    }))
+    .sort((a, b) => (isNaN(a._timeMs) ? 1 : isNaN(b._timeMs) ? -1 : a._timeMs - b._timeMs));
+
+  const earliestValid = validReports.find((r) => !isNaN(r._timeMs));
+  const originMs = earliestValid ? earliestValid._timeMs : null;
 
   drawerEl.innerHTML = `
     <div class="drawer-header-bar">
@@ -829,18 +840,35 @@ function renderDetailDrawer() {
           <span>02 · Evidence Convergence Timeline</span>
         </div>
         <div class="evidence-convergence-flow">
-          ${sortedReports.length > 0 ? `
+          ${validReports.length > 0 ? `
             <div class="timeline-signal-chain">
-              ${sortedReports.map((r, idx) => `
-                <div class="signal-chain-item" data-report-id="${esc(r.id)}">
-                  <div class="signal-chain-dot"></div>
-                  <span class="signal-chain-time">[T+${idx * 3}m]</span>
-                  <span style="font-weight: 700; color: var(--text-primary); text-transform: uppercase; font-size: 10px; margin-right: 6px;">
-                    ${esc(r.category || 'signal')}
-                  </span>
-                  ${esc(r.text)}
-                </div>
-              `).join('')}
+              ${validReports.map((r) => {
+                let timeLabel = '[SIGNAL]';
+                if (originMs != null && !isNaN(r._timeMs)) {
+                  const diffSec = Math.max(0, Math.floor((r._timeMs - originMs) / 1000));
+                  if (diffSec === 0) {
+                    timeLabel = '[T-0s Initial]';
+                  } else if (diffSec < 60) {
+                    timeLabel = `[+${diffSec}s]`;
+                  } else {
+                    const mins = Math.floor(diffSec / 60);
+                    const remSec = diffSec % 60;
+                    timeLabel = remSec > 0 ? `[+${mins}m ${remSec}s]` : `[+${mins}m]`;
+                  }
+                } else if (r.timestamp) {
+                  timeLabel = `[${relTime(r.timestamp)}]`;
+                }
+                return `
+                  <div class="signal-chain-item" data-report-id="${esc(r.id)}">
+                    <div class="signal-chain-dot"></div>
+                    <span class="signal-chain-time">${timeLabel}</span>
+                    <span style="font-weight: 700; color: var(--text-primary); text-transform: uppercase; font-size: 10px; margin-right: 6px;">
+                      ${esc(r.category || 'signal')}
+                    </span>
+                    ${esc(r.text)}
+                  </div>
+                `;
+              }).join('')}
             </div>
           ` : ''}
 
@@ -1040,11 +1068,22 @@ function bindSubmitFormEvents() {
 }
 
 async function selectIncident(id) {
+  if (!id) return;
   state.selectedIncidentId = id;
   patchSidebar();
 
+  if (selectAbortController) {
+    selectAbortController.abort();
+  }
+  selectAbortController = new AbortController();
+  const token = ++currentSelectToken;
+
   try {
-    const incData = await api.getIncident(id);
+    const incData = await api.getIncident(id, { signal: selectAbortController.signal });
+    // Guard against out-of-order responses or stale selections
+    if (token !== currentSelectToken || state.selectedIncidentId !== id) {
+      return;
+    }
     state.selectedIncident = incData;
 
     renderPipeline();
@@ -1057,16 +1096,38 @@ async function selectIncident(id) {
       flyToTarget(lat, lng, 14);
     }
   } catch (err) {
+    if (err.name === 'AbortError') return;
     showToast(`Failed to load incident detail: ${err.message}`, 'error');
   }
 }
 
-async function handleApprove(id) {
-  const btn = document.getElementById('btn-approve-action');
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = 'AUTHORIZING DISPATCH…';
+function setDecisionControlsBusy(isBusy, actionType = 'approve') {
+  state.decisionInProgress = isBusy;
+  const approveBtn = document.getElementById('btn-approve-action');
+  const rejectBtn = document.getElementById('btn-reject-action');
+
+  if (approveBtn) {
+    approveBtn.disabled = isBusy;
+    if (isBusy && actionType === 'approve') {
+      approveBtn.textContent = 'AUTHORIZING DISPATCH…';
+    } else if (!isBusy) {
+      approveBtn.textContent = '✓ APPROVE DISPATCH';
+    }
   }
+
+  if (rejectBtn) {
+    rejectBtn.disabled = isBusy;
+    if (isBusy && actionType === 'reject') {
+      rejectBtn.textContent = 'REJECTING…';
+    } else if (!isBusy) {
+      rejectBtn.textContent = '✕ REJECT / STAND DOWN';
+    }
+  }
+}
+
+async function handleApprove(id) {
+  if (state.decisionInProgress) return;
+  setDecisionControlsBusy(true, 'approve');
 
   try {
     await api.approve(id);
@@ -1077,19 +1138,15 @@ async function handleApprove(id) {
     }
   } catch (err) {
     showToast(`Approval failed: ${err.message}`, 'error');
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = '✓ APPROVE DISPATCH';
-    }
+    setDecisionControlsBusy(false);
+  } finally {
+    state.decisionInProgress = false;
   }
 }
 
 async function handleReject(id) {
-  const btn = document.getElementById('btn-reject-action');
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = 'REJECTING…';
-  }
+  if (state.decisionInProgress) return;
+  setDecisionControlsBusy(true, 'reject');
 
   try {
     await api.reject(id, 'Rejected by Human Operator');
@@ -1100,10 +1157,9 @@ async function handleReject(id) {
     }
   } catch (err) {
     showToast(`Rejection failed: ${err.message}`, 'error');
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = '✕ REJECT / STAND DOWN';
-    }
+    setDecisionControlsBusy(false);
+  } finally {
+    state.decisionInProgress = false;
   }
 }
 
@@ -1167,10 +1223,17 @@ async function handleTelemetrySubmit(e) {
 // ─────────────────────────────────────────────────────────────────
 async function reloadData() {
   try {
-    const [incData, repData, statData] = await Promise.all([
+    const activeDetailId = state.selectedIncidentId;
+    const fetchDetail = activeDetailId && !state.decisionInProgress;
+    const detailPromise = fetchDetail
+      ? api.getIncident(activeDetailId).catch(() => null)
+      : Promise.resolve(null);
+
+    const [incData, repData, statData, refreshedIncident] = await Promise.all([
       api.getIncidents(),
       api.getReports(),
       api.getStatus().catch(() => null),
+      detailPromise,
     ]);
 
     state.incidents = incData.incidents || [];
@@ -1178,6 +1241,16 @@ async function reloadData() {
     state.status = statData;
     state.backendOnline = true;
     state.loading = false;
+
+    // Reconcile open selected incident detail safely without race conditions
+    if (refreshedIncident && state.selectedIncidentId === activeDetailId && !state.decisionInProgress) {
+      state.selectedIncident = refreshedIncident;
+      renderDetailDrawer();
+    } else if (activeDetailId && !state.incidents.some((i) => i.id === activeDetailId)) {
+      state.selectedIncident = null;
+      state.selectedIncidentId = null;
+      renderDetailDrawer();
+    }
 
     renderHeader();
     renderPipeline();

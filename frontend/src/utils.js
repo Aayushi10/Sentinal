@@ -31,12 +31,14 @@ export function shortId(id) {
   return id.replace(/^([a-f0-9]{8}).*/i, '$1').toUpperCase();
 }
 
-export function fmtCoords(lat, lng) {
+export function fmtCoords(lat, lng, decimals = 4) {
   if (lat == null || lng == null) return '—';
   const latN = parseFloat(lat);
   const lngN = parseFloat(lng);
   if (!isFinite(latN) || !isFinite(lngN)) return '—';
-  return `${latN.toFixed(4)}°N, ${Math.abs(lngN).toFixed(4)}°W`;
+  const latDir = latN >= 0 ? 'N' : 'S';
+  const lngDir = lngN >= 0 ? 'E' : 'W';
+  return `${Math.abs(latN).toFixed(decimals)}°${latDir}, ${Math.abs(lngN).toFixed(decimals)}°${lngDir}`;
 }
 
 export function fmtConfidence(c) {
