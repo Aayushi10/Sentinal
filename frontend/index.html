@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SENTINEL — Autonomous Emergency Intelligence &amp; Dispatch</title>
+    <meta name="description" content="Mission-critical crisis telemetry correlation and human-in-the-loop dispatch orchestration." />
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <!-- Permanent layout shell: the map container is permanent and never destroyed by innerHTML -->
+    <div id="app">
+      <!-- Global Topbar -->
+      <header id="header" class="sentinel-header"></header>
+
+      <!-- Pipeline Strip -->
+      <nav id="pipeline-strip" class="sentinel-pipeline" aria-label="Incident Pipeline"></nav>
+
+      <!-- Main Workspace -->
+      <div class="sentinel-workspace">
+        <!-- Left Sidebar -->
+        <aside class="sentinel-sidebar" id="sentinel-sidebar">
+          <div class="sidebar-tabs" id="sidebar-tabs"></div>
+          <div class="sidebar-content" id="sidebar-content"></div>
+        </aside>
+
+        <!-- Center / Right Viewport -->
+        <main class="sentinel-viewport" id="sentinel-viewport">
+          <!-- Permanent Map Container -->
+          <div class="map-wrapper" id="map-wrapper">
+            <div id="sentinel-map"></div>
+            <!-- Lightweight Cinematic Globe Signal Acquisition Overlay -->
+            <div class="globe-intro-overlay" id="globe-intro-overlay">
+              <canvas id="sentinel-globe-canvas"></canvas>
+              <div class="globe-intro-telemetry" id="globe-intro-telemetry">
+                <div class="globe-status-pill">
+                  <span class="globe-radar-dot"></span>
+                  <span id="globe-telemetry-text">GLOBAL SIGNAL ACQUISITION IN PROGRESS...</span>
+                </div>
+              </div>
+            </div>
+            <!-- Floating Map HUD Overlay -->
+            <div class="map-hud" id="map-hud"></div>
+          </div>
+
+          <!-- Slide-out / Floating Detail Panel -->
+          <div class="detail-drawer" id="detail-drawer" style="display: none;"></div>
+        </main>
+      </div>
+    </div>
+
+    <div id="toast-container" class="toast-container"></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
