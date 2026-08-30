@@ -11,4 +11,4 @@ export const trueforge = new TrueForge({
 });
 
 /** The saved agent name registered in TrueForge. */
-export const AGENT_NAME = 'sentinel-prod-v1';
+export const AGENT_NAME = process.env.TRUEFORGE_AGENT_NAME ?? 'sentinel-prod-v1';

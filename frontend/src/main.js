@@ -18,6 +18,7 @@ import {
 const state = {
   incidents: [],
   reports: [],
+  investigations: [],
   status: null,
   selectedIncidentId: null,
   selectedIncident: null,
@@ -65,11 +66,16 @@ function initLeafletMap() {
     attributionControl: false,
   });
 
-  // Pitch-Black High-Resolution Vector Tiles (lossless PNG, up to zoom 19, zero distortion)
-  blackTileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    subdomains: ['a', 'b', 'c'],
-    maxZoom: 19,
+  // Pitch-Black High-Resolution Tactical Base (100% open, zero API key, no watermarks)
+  blackTileLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 16,
     attribution: '',
+  }).addTo(map);
+
+  // Crisp Vector Street, City & District Labels
+  const labelsLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 16,
+    pane: 'overlayPane',
   }).addTo(map);
 
   // Night Satellite Imagery Layer (Available via 1-click toggle)
@@ -246,10 +252,73 @@ function updateIncidentField() {
   updateMapHUD();
 }
 
+/**
+ * Place (or replace) a glowing highlighted dot on the map for a report.
+ * Used for unlinked reports that are never drawn as part of an incident cluster.
+ */
+function pinActiveReport(rep) {
+  if (!map || !reportLayerGroup) return;
+  const rLat = parseFloat(rep.lat);
+  const rLng = parseFloat(rep.lng);
+  if (!isFinite(rLat) || !isFinite(rLng)) return;
+
+  const cat = (rep.category || 'other').toLowerCase();
+  let dotColor = '#94a3b8';
+  if (cat === 'fire')   dotColor = '#f87171';
+  if (cat === 'hazard') dotColor = '#fbbf24';
+  if (cat === 'crime')  dotColor = '#c084fc';
+
+  const icon = L.divIcon({
+    className: '',
+    html: `
+      <div style="
+        width: 16px; height: 16px;
+        border-radius: 50%;
+        background: ${dotColor};
+        border: 2px solid #fff;
+        box-shadow: 0 0 14px ${dotColor}, 0 0 28px ${dotColor};
+        animation: radar-ping 1.5s infinite;
+      "></div>
+    `,
+    iconSize: [16, 16],
+    iconAnchor: [8, 8],
+  });
+
+  const marker = L.marker([rLat, rLng], { icon, zIndexOffset: 900 });
+  marker.bindPopup(`
+    <div style="max-width: 220px; font-family: sans-serif;">
+      <div style="font-size: 10px; font-weight: 800; color: ${dotColor}; text-transform: uppercase; margin-bottom: 2px;">
+        ${cat} Telemetry Signal
+      </div>
+      <div style="font-size: 12px; color: #f8fafc; margin-bottom: 4px; line-height: 1.4;">
+        ${esc(truncate(rep.text, 80))}
+      </div>
+      <div style="font-size: 10px; font-family: monospace; color: #94a3b8;">
+        ${fmtCoords(rep.lat, rep.lng)} · ${relTime(rep.timestamp)}
+      </div>
+    </div>
+  `);
+
+  // Clear previous standalone pins, add fresh one, and open its popup
+  reportLayerGroup.clearLayers();
+  reportLayerGroup.addLayer(marker);
+  marker.openPopup();
+}
+
 function flyToTarget(lat, lng, zoom = 14) {
   if (!map || !isFinite(lat) || !isFinite(lng)) return;
   try {
-    map.flyTo([lat, lng], zoom, { duration: 1.2, easeLinearity: 0.25 });
+    // The detail drawer covers ~56% from the bottom of the map.
+    // By flying to a point slightly SOUTH of the marker (positive y = south),
+    // the marker appears ABOVE the viewport centre — in the clear top section.
+    const mapHeight = map.getContainer().offsetHeight;
+    const upshiftPx = mapHeight * 0.25; // 25% of map height above centre
+
+    const markerPoint = map.project([lat, lng], zoom);
+    const adjustedPoint = L.point(markerPoint.x, markerPoint.y + upshiftPx);
+    const adjustedLatLng = map.unproject(adjustedPoint, zoom);
+
+    map.flyTo(adjustedLatLng, zoom, { duration: 1.2, easeLinearity: 0.25 });
   } catch (e) {
     console.warn('Map flyTo failed', e);
   }
@@ -616,11 +685,11 @@ function renderSignalStream() {
   return `
     <div class="signal-stream-container">
       ${state.reports.map((rep) => {
-        const cat = (rep.category || 'other').toLowerCase();
-        const isLinked = !!rep.incident_id;
-        const isActive = state.activeSignalId === rep.id;
+    const cat = (rep.category || 'other').toLowerCase();
+    const isLinked = !!rep.incident_id;
+    const isActive = state.activeSignalId === rep.id;
 
-        return `
+    return `
           <div class="signal-stream-item ${isActive ? 'active-signal' : ''}"
                data-report-id="${esc(rep.id)}"
                data-incident-id="${esc(rep.incident_id || '')}"
@@ -634,12 +703,12 @@ function renderSignalStream() {
             <div class="signal-bottom-line">
               <span>${fmtCoords(rep.lat, rep.lng)}</span>
               ${isLinked
-                ? `<span style="color: var(--amber-bright); font-weight: 700;">→ INC #${shortId(rep.incident_id)}</span>`
-                : `<span style="color: var(--text-tertiary);">Uncorrelated</span>`}
+        ? `<span style="color: var(--amber-bright); font-weight: 700;">→ INC #${shortId(rep.incident_id)}</span>`
+        : `<span style="color: var(--text-tertiary);">Uncorrelated</span>`}
             </div>
           </div>
         `;
-      }).join('')}
+  }).join('')}
     </div>
   `;
 }
@@ -843,22 +912,22 @@ function renderDetailDrawer() {
           ${validReports.length > 0 ? `
             <div class="timeline-signal-chain">
               ${validReports.map((r) => {
-                let timeLabel = '[SIGNAL]';
-                if (originMs != null && !isNaN(r._timeMs)) {
-                  const diffSec = Math.max(0, Math.floor((r._timeMs - originMs) / 1000));
-                  if (diffSec === 0) {
-                    timeLabel = '[T-0s Initial]';
-                  } else if (diffSec < 60) {
-                    timeLabel = `[+${diffSec}s]`;
-                  } else {
-                    const mins = Math.floor(diffSec / 60);
-                    const remSec = diffSec % 60;
-                    timeLabel = remSec > 0 ? `[+${mins}m ${remSec}s]` : `[+${mins}m]`;
-                  }
-                } else if (r.timestamp) {
-                  timeLabel = `[${relTime(r.timestamp)}]`;
-                }
-                return `
+    let timeLabel = '[SIGNAL]';
+    if (originMs != null && !isNaN(r._timeMs)) {
+      const diffSec = Math.max(0, Math.floor((r._timeMs - originMs) / 1000));
+      if (diffSec === 0) {
+        timeLabel = '[T-0s Initial]';
+      } else if (diffSec < 60) {
+        timeLabel = `[+${diffSec}s]`;
+      } else {
+        const mins = Math.floor(diffSec / 60);
+        const remSec = diffSec % 60;
+        timeLabel = remSec > 0 ? `[+${mins}m ${remSec}s]` : `[+${mins}m]`;
+      }
+    } else if (r.timestamp) {
+      timeLabel = `[${relTime(r.timestamp)}]`;
+    }
+    return `
                   <div class="signal-chain-item" data-report-id="${esc(r.id)}">
                     <div class="signal-chain-dot"></div>
                     <span class="signal-chain-time">${timeLabel}</span>
@@ -868,7 +937,7 @@ function renderDetailDrawer() {
                     ${esc(r.text)}
                   </div>
                 `;
-              }).join('')}
+  }).join('')}
             </div>
           ` : ''}
 
@@ -980,14 +1049,56 @@ function bindSignalStreamEvents() {
       document.querySelectorAll('.signal-stream-item').forEach(c => c.classList.remove('active-signal'));
       card.classList.add('active-signal');
 
+      const repLat = parseFloat(card.dataset.lat);
+      const repLng = parseFloat(card.dataset.lng);
+      const hasRepCoords = isFinite(repLat) && isFinite(repLng);
+
       if (card.dataset.incidentId) {
-        state.sidebarTab = 'incidents';
-        renderSidebarTabs();
-        selectIncident(card.dataset.incidentId);
-      } else if (card.dataset.lat && card.dataset.lng) {
-        const lat = parseFloat(card.dataset.lat);
-        const lng = parseFloat(card.dataset.lng);
-        flyToTarget(lat, lng, 15);
+        // Show the report's dot on the map first — don't immediately hijack
+        // the view with the incident drawer. The user clicked a REPORT.
+        const rep = state.reports.find(r => r.id === card.dataset.reportId);
+        if (rep) pinActiveReport(rep);
+        if (hasRepCoords) flyToTarget(repLat, repLng, 15);
+
+        // Offer the incident as an opt-in via a clickable toast
+        const incShort = shortId(card.dataset.incidentId);
+        const toastEl = document.createElement('div');
+        toastEl.className = 'toast warning';
+        toastEl.innerHTML = `
+          <span class="toast-icon">⚡</span>
+          <span class="toast-message">
+            Linked to INC #${incShort}
+            <button onclick="this.closest('.toast').remove(); window.__sentinelViewInc && window.__sentinelViewInc('${card.dataset.incidentId}')"
+              style="margin-left:8px; background: rgba(245,158,11,0.2); border: 1px solid rgba(245,158,11,0.5);
+                     color: #fbbf24; font-size: 10px; font-weight: 700; padding: 2px 8px;
+                     border-radius: 4px; cursor: pointer; letter-spacing: 0.05em;">
+              VIEW INCIDENT →
+            </button>
+          </span>
+        `;
+        // expose handler globally so inline onclick can reach it
+        window.__sentinelViewInc = (id) => {
+          state.sidebarTab = 'incidents';
+          renderSidebarTabs();
+          selectIncident(id);
+        };
+        const c = document.querySelector('.toast-container') || (() => {
+          const el = document.createElement('div');
+          el.className = 'toast-container';
+          document.body.appendChild(el);
+          return el;
+        })();
+        c.appendChild(toastEl);
+        setTimeout(() => {
+          toastEl.style.animation = 'toast-out 250ms ease forwards';
+          setTimeout(() => toastEl.remove(), 260);
+        }, 5000);
+
+      } else if (hasRepCoords) {
+        // Unlinked report — place a highlighted dot directly on the map
+        const rep = state.reports.find(r => r.id === card.dataset.reportId);
+        if (rep) pinActiveReport(rep);
+        flyToTarget(repLat, repLng, 15);
         showToast('Targeting telemetry signal on map', 'success', 1800);
       }
     });
@@ -1193,7 +1304,7 @@ async function handleTelemetrySubmit(e) {
   btn.textContent = 'Broadcasting to Sentinel…';
 
   try {
-    await api.submitReport({ text, lat, lng, category });
+    const createdReport = await api.submitReport({ text, lat, lng, category });
     showToast('Field observation transmitted to Sentinel AI Engine', 'success');
 
     state.reportDraft = { text: '', lat: '', lng: '', category: 'other' };
@@ -1203,10 +1314,21 @@ async function handleTelemetrySubmit(e) {
     }
     form.reset();
 
+    // Clear any previously open incident drawer so user sees fresh telemetry view
+    state.selectedIncidentId = null;
+    state.selectedIncident = null;
+    renderDetailDrawer();
+
+    // Switch to telemetry reports tab and focus on newly created report
+    state.sidebarTab = 'reports';
     await reloadData();
-    state.sidebarTab = 'incidents';
     renderSidebarTabs();
     patchSidebar();
+
+    // Place high-visibility pulsing dot at the report location
+    pinActiveReport(createdReport || { text, lat, lng, category, timestamp: new Date().toISOString() });
+    flyToTarget(lat, lng, 15);
+    void pollInvestigations();
   } catch (err) {
     if (errEl) {
       errEl.textContent = `Transmission error: ${err.message}`;
@@ -1229,15 +1351,17 @@ async function reloadData() {
       ? api.getIncident(activeDetailId).catch(() => null)
       : Promise.resolve(null);
 
-    const [incData, repData, statData, refreshedIncident] = await Promise.all([
+    const [incData, repData, statData, pendData, refreshedIncident] = await Promise.all([
       api.getIncidents(),
       api.getReports(),
       api.getStatus().catch(() => null),
+      api.getPendingApprovals().catch(() => ({ pending_approvals: [] })),
       detailPromise,
     ]);
 
     state.incidents = incData.incidents || [];
     state.reports = repData.reports || [];
+    state.pendingApprovals = pendData.pending_approvals || [];
     state.status = statData;
     state.backendOnline = true;
     state.loading = false;
@@ -1273,9 +1397,9 @@ function isPendingDecision(inc) {
   if (!inc) return false;
   const status = String(inc.status || '').toUpperCase();
   return status === 'PENDING_APPROVAL' ||
-         inc.active_approval != null ||
-         inc.approval_status === 'PENDING' ||
-         (inc.pending_session_id != null && inc.pending_turn_id != null);
+    inc.active_approval != null ||
+    inc.approval_status === 'PENDING' ||
+    (inc.pending_session_id != null && inc.pending_turn_id != null);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1316,10 +1440,11 @@ async function bootstrap() {
     }, 300);
   }
 
-  // Polling cycle (every 5 seconds)
-  setInterval(() => {
-    reloadData();
-  }, 5000);
+  // Main data polling cycle (every 5 seconds)
+  setInterval(() => { reloadData(); }, 5000);
+
+  // Investigation feed polling (every 3 seconds)
+  setInterval(() => { pollInvestigations(); }, 3000);
 
   // Esc closes drawer
   window.addEventListener('keydown', (e) => {
@@ -1333,4 +1458,155 @@ async function bootstrap() {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Live Investigation Feed
+// ─────────────────────────────────────────────────────────────────
+
+async function pollInvestigations() {
+  try {
+    const data = await api.getInvestigations();
+    state.investigations = data.investigations ?? [];
+    renderInvestigationFeed();
+  } catch {
+    // silently fail — backend may be restarting
+  }
+}
+
+function renderInvestigationFeed() {
+  const investigations = state.investigations ?? [];
+  const active = investigations.filter(inv =>
+    inv.status === 'investigating' || inv.status === 'queued' ||
+    inv.status === 'awaiting_approval' || inv.status === 'failed' ||
+    inv.status === 'completed'
+  );
+
+  let panel = document.getElementById('investigation-feed');
+
+  if (active.length === 0) {
+    if (panel) {
+      panel.classList.add('inv-feed-hiding');
+      setTimeout(() => panel?.remove(), 300);
+    }
+    return;
+  }
+
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'investigation-feed';
+    panel.className = 'investigation-feed';
+    (document.querySelector('.map-wrapper') || document.body).appendChild(panel);
+  }
+
+  const catColor = { fire: '#f87171', hazard: '#fbbf24', crime: '#c084fc', other: '#94a3b8' };
+  const catIcon  = { fire: '🔥', hazard: '⚠️', crime: '🚔', other: '📡' };
+
+  panel.innerHTML = `
+    <div class="inv-feed-header">
+      <div class="inv-feed-title">
+        <span class="inv-live-dot"></span>
+        🤖 AGENT INVESTIGATION
+      </div>
+      <span class="inv-feed-badge">${active.length} ACTIVE</span>
+    </div>
+    ${active.map(inv => {
+      const elapsed = Math.round((Date.now() - new Date(inv.startedAt).getTime()) / 1000);
+      const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed/60)}m ${elapsed%60}s`;
+      const color = catColor[inv.category] || '#94a3b8';
+      const icon  = catIcon[inv.category] || '📡';
+      const activeStepIdx = inv.steps.findIndex(s => !s.completedAt);
+
+      const statusLabel = {
+        queued:             '<span class="inv-status queued">⏸ QUEUED</span>',
+        investigating:      '<span class="inv-status investigating">⟳ INVESTIGATING</span>',
+        awaiting_approval:  '<span class="inv-status approval">⚡ AWAITING APPROVAL</span>',
+        completed:          '<span class="inv-status completed">✓ COMPLETE</span>',
+        failed:             '<span class="inv-status failed">✕ AGENT ERROR</span>',
+      }[inv.status] ?? '';
+
+      const stepsHtml = inv.steps.length ? `
+        <div class="inv-steps">
+          ${inv.steps.map((step, i) => {
+            const done   = !!step.completedAt;
+            const active = !done && i === activeStepIdx;
+            const cls    = done ? 'done' : active ? 'active' : 'pending';
+            const icon   = done ? '✓' : active ? '<span class="inv-spin">⟳</span>' : '○';
+            return `<div class="inv-step ${cls}">
+              <span class="inv-step-icon">${icon}</span>
+              <span class="inv-step-label">${esc(step.label)}</span>
+            </div>`;
+          }).join('')}
+        </div>` : `<div class="inv-step pending"><span class="inv-spin">⟳</span><span class="inv-step-label">Connecting to TrueForge agent…</span></div>`;
+
+      const findingsHtml = inv.findings && inv.status !== 'awaiting_approval' ? `
+        <div class="inv-findings">
+          <div class="inv-findings-label">AGENT FINDINGS</div>
+          <div class="inv-findings-text">${esc(inv.findings.slice(0, 260))}${inv.findings.length > 260 ? '…' : ''}</div>
+        </div>` : '';
+
+      const summaryText = inv.approval?.question || inv.findings || inv.approval?.target || 'Emergency unit dispatch proposed';
+
+      const approvalHtml = inv.status === 'awaiting_approval' ? `
+        <div class="inv-approval-box">
+          <div class="inv-approval-title">⚡ HUMAN AUTHORIZATION REQUIRED</div>
+          <div class="inv-approval-rec">
+            ${esc(summaryText).replace(/\n/g, '<br>')}
+          </div>
+          <div class="inv-approval-actions">
+            <button class="inv-btn-approve" id="btn-inv-approve-${inv.reportId}" onclick="handleInvestigationApproval('${inv.approval?.id || inv.reportId}', true, '${inv.reportId}')">
+              ✓ APPROVE DISPATCH
+            </button>
+            <button class="inv-btn-reject" id="btn-inv-reject-${inv.reportId}" onclick="handleInvestigationApproval('${inv.approval?.id || inv.reportId}', false, '${inv.reportId}')">
+              ✕ REJECT
+            </button>
+          </div>
+        </div>` : '';
+
+      return `
+        <div class="inv-card ${inv.status === 'awaiting_approval' ? 'inv-card-urgent' : ''}">
+          <div class="inv-card-top">
+            <span class="inv-cat-icon" style="color:${color}">${icon}</span>
+            <span class="inv-report-snippet">"${esc(inv.reportText.slice(0, 72))}${inv.reportText.length > 72 ? '…' : ''}"</span>
+          </div>
+          <div class="inv-card-meta">
+            ${statusLabel}
+            <span class="inv-elapsed">⏱ ${elapsedStr}</span>
+          </div>
+          ${stepsHtml}
+          ${findingsHtml}
+          ${approvalHtml}
+        </div>`;
+    }).join('')}
+  `;
+}
+
+// Global handler for approving / rejecting directly from live investigation card
+window.handleInvestigationApproval = async function (targetId, isApprove, reportId) {
+  const btnApprove = reportId ? document.getElementById(`btn-inv-approve-${reportId}`) : null;
+  const btnReject = reportId ? document.getElementById(`btn-inv-reject-${reportId}`) : null;
+  if (btnApprove) btnApprove.disabled = true;
+  if (btnReject) btnReject.disabled = true;
+
+  try {
+    if (isApprove) {
+      if (btnApprove) btnApprove.textContent = 'AUTHORIZING…';
+      showToast('Authorizing emergency dispatch...', 'warning');
+      await api.approve(targetId);
+      showToast('Dispatch authorized! Units deployed.', 'success', 3500);
+    } else {
+      const reason = prompt('Enter stand-down reason:', 'Operator rejected action') || 'Rejected by operator';
+      if (btnReject) btnReject.textContent = 'REJECTING…';
+      showToast('Rejecting agent dispatch...', 'warning');
+      await api.reject(targetId, reason);
+      showToast('Action rejected. Incident status updated.', 'warning', 3500);
+    }
+    await reloadData();
+    await pollInvestigations();
+  } catch (err) {
+    showToast(`Decision error: ${err.message}`, 'error', 4000);
+    if (btnApprove) { btnApprove.disabled = false; btnApprove.textContent = '✓ APPROVE DISPATCH'; }
+    if (btnReject) { btnReject.disabled = false; btnReject.textContent = '✕ REJECT'; }
+  }
+};
+
 bootstrap();
+
