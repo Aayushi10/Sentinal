@@ -3,6 +3,12 @@
 **Team:** BlackBox  
 > **Bridging the critical gap between chaotic public telemetry and decisive emergency response through AI signal correlation, spatial convergence, and verified human authority.**
 
+- **Live App / Frontend:** [https://sentinal-ai-v1.vercel.app/](https://sentinal-ai-v1.vercel.app/)
+- **GitHub:** [https://github.com/Aayushi10/Sentinal](https://github.com/Aayushi10/Sentinal)
+- **Backend:** [https://sentinal-backend-u1ko.onrender.com](https://sentinal-backend-u1ko.onrender.com/)
+- **MCP Server:** [https://sentinal-kwaq.onrender.com/mcp](https://sentinal-kwaq.onrender.com/)
+- **True Forge:** [https://trueforge-0-2-0.onrender.com/](https://trueforge-0-2-0.onrender.com/settings)
+
 ---
 
 ## System Components & Architecture
