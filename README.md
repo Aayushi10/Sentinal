@@ -80,45 +80,21 @@ Most of our friction was in deployment, not in building the agent itself. Gettin
 - **Python:** `>= 3.11` with [`uv`](https://docs.astral.sh/uv/)
 - **PostgreSQL:** PostgreSQL database with `pgcrypto` enabled (e.g. Supabase)
 
-### 1. Database Setup
-```bash
-# Navigate to mcp-server from repository root
-cd mcp-server
-export DATABASE_URL="postgresql://postgres:password@localhost:5432/postgres"
-psql "$DATABASE_URL" -f schema.sql
-psql "$DATABASE_URL" -f seed.sql
-cd ..
-```
+### Component Setup Guides
+For setup and run instructions, refer to each component's dedicated documentation:
+- **Database & MCP Server:** Refer to [mcp-server/README.md](mcp-server/README.md)
+- **Backend Service & TrueForge:** Refer to [backend/README.md](backend/README.md)
+- **Tactical Frontend:** Refer to [frontend/README.md](frontend/README.md)
 
-### 2. Backend Setup
-For detailed backend documentation, see [backend/README.md](backend/README.md).
-```bash
-# Navigate to backend from repository root
-cd backend
-cp .env.example .env     # Configure your DATABASE_URL and secrets
-pnpm install             # Install dependencies first
-node run-migration.js    # Run database migrations
-pnpm run dev             # Starts server at http://localhost:3001
-cd ..
-```
+---
 
-### 3. MCP Server & Agent Setup
-For detailed MCP server documentation, see [mcp-server/README.md](mcp-server/README.md).
-```bash
-# Terminal 1: Run MCP Server (from repository root)
-cd mcp-server
-uv run python mcp_server.py
+## Screenshots & Visuals
 
-# Terminal 2: Run TrueForge Agent Engine
-npx @truefoundry/trueforge
-```
+### PostgreSQL Schema
+<img width="767" height="700" alt="postgres_schema" src="https://github.com/user-attachments/assets/d18967b9-352a-49a5-b8a8-af87f8ea89b0" />
 
-### 4. Frontend Setup
-For detailed frontend documentation, see [frontend/README.md](frontend/README.md).
-```bash
-# Terminal 3: Run Tactical Console (from repository root)
-cd frontend
-pnpm install             # Install dependencies
-pnpm run dev             # Starts tactical console at http://localhost:5173
-```
-Open your browser at **`http://localhost:5173`** to access the Sentinel Tactical Console.
+### Qodo Code Review
+<img width="1202" height="720" alt="qodo" src="https://github.com/user-attachments/assets/50533660-2544-4c98-834a-84d92eed3946" />
+
+### TrueForge Chat Approval & Rejection
+<img width="732" height="305" alt="trueforge-chat approve-reject" src="https://github.com/user-attachments/assets/cccdbb44-a2cc-47a8-9937-c0cb993cdbc6" />

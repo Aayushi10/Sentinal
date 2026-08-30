@@ -15,6 +15,7 @@ import dotenv from 'dotenv';
 import reportsRouter from './routes/reports';
 import incidentsRouter from './routes/incidents';
 import { pool } from './db';
+import { activeInvestigations } from './agent';
 
 dotenv.config();
 
@@ -77,6 +78,15 @@ app.get('/status', async (_req, res) => {
     console.error('[/status] DB error:', err);
     res.status(500).json({ error: 'Failed to fetch status' });
   }
+});
+
+/**
+ * GET /investigations
+ * Returns all live agent investigation sessions so the frontend can render
+ * a real-time investigation feed without SSE.
+ */
+app.get('/investigations', (_req, res) => {
+  res.json({ investigations: Array.from(activeInvestigations.values()) });
 });
 
 // ---------------------------------------------------------------------------

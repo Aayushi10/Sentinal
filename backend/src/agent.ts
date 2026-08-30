@@ -13,6 +13,51 @@ import { pool } from './db';
 import { trueforge, AGENT_NAME } from './trueforge';
 
 // ---------------------------------------------------------------------------
+// Live Investigation Tracking (polled by GET /investigations)
+// ---------------------------------------------------------------------------
+
+export interface InvestigationStep {
+  tool: string;
+  label: string;
+  startedAt: string;
+  completedAt?: string;
+}
+
+export interface InvestigationStatus {
+  reportId: string;
+  reportText: string;
+  category: string;
+  sessionId: string;
+  startedAt: string;
+  steps: InvestigationStep[];
+  findings: string;
+  status: 'queued' | 'investigating' | 'awaiting_approval' | 'completed' | 'failed';
+  updatedAt: string;
+}
+
+/** Active investigations keyed by reportId. Created synchronously on queue, removed after completion. */
+export const activeInvestigations = new Map<string, InvestigationStatus>();
+
+const TOOL_LABELS: Record<string, string> = {
+  search_reports:              'Scanning nearby incident reports',
+  get_report_details:          'Analyzing report details',
+  geocode_location:            'Geocoding location reference',
+  check_response_resources:    'Checking emergency resource availability',
+  create_incident_action:      'Formulating tactical recommendation',
+};
+
+function scheduleInvestigationCleanup(reportId: string, delayMs = 15_000): void {
+  setTimeout(() => {
+    const inv = activeInvestigations.get(reportId);
+    // Keep card sticky while waiting for human decision
+    if (inv && inv.status === 'awaiting_approval') {
+      return;
+    }
+    activeInvestigations.delete(reportId);
+  }, delayMs);
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency Limiter
 // ---------------------------------------------------------------------------
 const MAX_CONCURRENT_SESSIONS = parseInt(process.env.MAX_CONCURRENT_SESSIONS ?? '5', 10);
@@ -29,12 +74,31 @@ export function queueAgentSession(
   reportLng: number,
   category: string,
 ): void {
+  // Create investigation entry immediately so the frontend sees it on the next poll.
+  activeInvestigations.set(reportId, {
+    reportId,
+    reportText: reportText.slice(0, 160),
+    category,
+    sessionId: '',
+    startedAt: new Date().toISOString(),
+    steps: [],
+    findings: '',
+    status: activeSessions < MAX_CONCURRENT_SESSIONS ? 'investigating' : 'queued',
+    updatedAt: new Date().toISOString(),
+  });
+
   const task = async () => {
     activeSessions++;
     try {
       await executeAgentSession(reportId, reportText, reportLat, reportLng, category);
     } catch (err) {
       console.error(`[agent] Session failed for report ${reportId}:`, err);
+      const inv = activeInvestigations.get(reportId);
+      if (inv) {
+        inv.status = 'failed';
+        inv.updatedAt = new Date().toISOString();
+        scheduleInvestigationCleanup(reportId, 20_000);
+      }
     } finally {
       activeSessions--;
       const next = sessionQueue.shift();
@@ -119,6 +183,7 @@ async function processTurnStream(
   const pendingApprovals: TrueForgeApi.ToolApprovalRequiredEvent[] = [];
   let turnId: string | undefined;
   let terminalStatus: string | undefined;
+  const toolCallIdToName = new Map<string, string>(); // for investigation step tracking
 
   for await (const event of stream) {
     if (event.type === 'turn.created') {
@@ -131,6 +196,90 @@ async function processTurnStream(
     } else {
       events.set(event.id, event);
     }
+
+    // --- Live investigation tracking (initial sessions only) ---
+    if (context.reportId) {
+      const investigation = activeInvestigations.get(context.reportId);
+      if (investigation) {
+        // After merge, check the resolved event for tool calls
+        const resolved = isEventDelta(event) ? events.get(event.id) : event;
+        if (resolved?.type === 'model.message') {
+          const msg = resolved as TrueForgeApi.ModelMessageEvent;
+          // Register new tool calls as pending steps
+          for (const tc of (msg.toolCalls ?? [])) {
+            if (!toolCallIdToName.has(tc.id)) {
+              let toolName = (tc.toolInfo as { name?: string } | undefined)?.name ?? tc.id;
+              
+              // If wrapped by TrueForge system call_tool / get_tool_info, extract inner tool name
+              if ((toolName === 'call_tool' || toolName === 'get_tool_info') && tc.function?.arguments) {
+                try {
+                  const args = JSON.parse(tc.function.arguments);
+                  if (args.tool_name) {
+                    toolName = args.tool_name;
+                  }
+                } catch {
+                  // ignore json parse error
+                }
+              }
+
+              toolCallIdToName.set(tc.id, toolName);
+              // Only add domain steps or distinct steps (skip meta discovery noise)
+              if (toolName !== 'list_tools' && toolName !== 'get_current_datetime' && !investigation.steps.some(s => s.tool === toolName)) {
+                investigation.steps.push({
+                  tool: toolName,
+                  label: TOOL_LABELS[toolName] ?? (toolName === 'exec' ? 'Running correlation analysis' : toolName),
+                  startedAt: new Date().toISOString(),
+                });
+              }
+            }
+          }
+          // Capture agent reasoning text (non-tool-call messages only)
+          const content = msg.content;
+          if (content && !msg.toolCalls?.length) {
+            const text = typeof content === 'string'
+              ? content
+              : (content as Array<{ text?: string }>).map(p => p.text ?? '').join('');
+            if (text.trim().length > 20) {
+              investigation.findings = text.slice(0, 700);
+            }
+          }
+          investigation.updatedAt = new Date().toISOString();
+        }
+
+        // Mark step completed when tool response arrives
+        if (event.type === 'tool.response' && !isEventDelta(event)) {
+          const tr = event as TrueForgeApi.ToolResponseEvent;
+          const toolName = toolCallIdToName.get((tr as { toolCallId?: string }).toolCallId ?? '');
+          if (toolName) {
+            const step = investigation.steps.find(s => s.tool === toolName && !s.completedAt);
+            if (step) step.completedAt = new Date().toISOString();
+          }
+          investigation.updatedAt = new Date().toISOString();
+        }
+
+        if (event.type === 'tool.approval_required') {
+          investigation.status = 'awaiting_approval';
+          investigation.updatedAt = new Date().toISOString();
+          // Keep for 5 min so human can see it while deciding
+          scheduleInvestigationCleanup(context.reportId, 5 * 60 * 1000);
+        }
+
+        if (event.type === 'turn.done' && investigation.status !== 'awaiting_approval') {
+          const done = event as TrueForgeApi.TurnDoneEvent;
+          const isErr = done.state?.status === 'error';
+          investigation.status = isErr ? 'failed' : 'completed';
+          if (isErr && done.state?.message) {
+            const errMsg = done.state.message.includes('429')
+              ? 'LLM Rate Limit (429) encountered. Please wait a few seconds.'
+              : done.state.message;
+            investigation.findings = `⚠️ ${errMsg}`;
+          }
+          investigation.updatedAt = new Date().toISOString();
+          scheduleInvestigationCleanup(context.reportId, isErr ? 20_000 : 12_000);
+        }
+      }
+    }
+    // --- End investigation tracking ---
 
     // Capture tool responses (e.g. create_incident_action returning new incident_id)
     if (event.type === 'tool.response') {
@@ -159,14 +308,39 @@ async function processTurnStream(
       }
     }
 
-    if (event.type === 'tool.approval_required') {
+    if (event.type === 'tool.approval_required' || event.type === 'tool.response_required') {
       pendingApprovals.push(event as TrueForgeApi.ToolApprovalRequiredEvent);
+      if (context.reportId) {
+        const inv = activeInvestigations.get(context.reportId);
+        if (inv) {
+          inv.status = 'awaiting_approval';
+          inv.updatedAt = new Date().toISOString();
+          scheduleInvestigationCleanup(context.reportId, 5 * 60 * 1000);
+        }
+      }
     }
 
     if (event.type === 'turn.done') {
       const done = event as TrueForgeApi.TurnDoneEvent;
-      terminalStatus = done.state.status;
-      console.log(`[agent] Turn completed with status: ${terminalStatus}`);
+      terminalStatus = done.state?.status;
+      // Check if turn finished with requiredActions (e.g. tool.response_required or tool.approval_required)
+      const hasRequiredActions = (done.state?.requiredActions?.length || 0) > 0;
+      if (hasRequiredActions && done.state?.requiredActions) {
+        for (const req of done.state.requiredActions) {
+          if (!pendingApprovals.some(p => p.id === req.id)) {
+            pendingApprovals.push(req as unknown as TrueForgeApi.ToolApprovalRequiredEvent);
+          }
+        }
+        if (context.reportId) {
+          const inv = activeInvestigations.get(context.reportId);
+          if (inv) {
+            inv.status = 'awaiting_approval';
+            inv.updatedAt = new Date().toISOString();
+            scheduleInvestigationCleanup(context.reportId, 5 * 60 * 1000);
+          }
+        }
+      }
+      console.log(`[agent] Turn completed with status: ${terminalStatus}, hasRequiredActions: ${hasRequiredActions}`);
     }
   }
 
@@ -176,28 +350,44 @@ async function processTurnStream(
 
     for (const pending of pendingApprovals) {
       for (const ref of pending.toolCalls) {
-        const msg = events.get(ref.sourceEventId);
-        if (msg?.type !== 'model.message') continue;
-        const modelMsg = msg as TrueForgeApi.ModelMessageEvent;
-        const call = modelMsg.toolCalls?.find((tc) => tc.id === ref.id);
+        // Find matching tool call across all events (or merged model.message)
+        let call: TrueForgeApi.ToolCall | undefined;
+        for (const evt of events.values()) {
+          if (evt.type === 'model.message') {
+            const tc = (evt as TrueForgeApi.ModelMessageEvent).toolCalls?.find((t) => t.id === ref.id);
+            if (tc) { call = tc; break; }
+          }
+        }
         if (!call) continue;
 
         let callArgs: Record<string, unknown> = {};
         try {
-          callArgs = JSON.parse(call.function.arguments || '{}');
+          callArgs = JSON.parse(call.function?.arguments || '{}');
         } catch {
-          callArgs = { raw: call.function.arguments };
+          callArgs = { raw: call.function?.arguments };
         }
 
-        const targetIncidentId =
-          isValidUuid(callArgs.incident_id) ? callArgs.incident_id : context.incidentId ?? null;
+        // TrueForge wraps MCP tool calls in call_tool system tool
+        let actualToolName = call.toolInfo?.name ?? 'create_incident_action';
+        let innerArgs = callArgs;
+        if (callArgs.tool_name) {
+          actualToolName = String(callArgs.tool_name);
+        }
+        if (callArgs.input && typeof callArgs.input === 'object') {
+          innerArgs = callArgs.input as Record<string, unknown>;
+        }
+
+        const action = (innerArgs.action || callArgs.action || 'CREATE_INCIDENT') as string;
+        const target = (innerArgs.target || callArgs.target || recommendation || 'Emergency dispatch requested') as string;
+        const rawIncidentId = innerArgs.incident_id || callArgs.incident_id;
+        const targetIncidentId = isValidUuid(rawIncidentId) ? rawIncidentId : context.incidentId ?? null;
 
         console.log(
-          `[agent] Recording pending approval: ${call.toolInfo.name} action=${callArgs.action} target=${callArgs.target}`,
+          `[agent] Recording pending approval: ${actualToolName} action=${action} target=${target}`,
         );
 
         // Store into dedicated pending_approvals table
-        await pool.query(
+        const { rows: inserted } = await pool.query<{ id: string }>(
           `INSERT INTO pending_approvals (
              session_id, turn_id, thread_id, tool_call_id,
              report_id, incident_id, tool_name, action, target,
@@ -209,7 +399,8 @@ async function processTurnStream(
                evidence = EXCLUDED.evidence,
                recommendation = EXCLUDED.recommendation,
                status = 'PENDING',
-               updated_at = NOW()`,
+               updated_at = NOW()
+           RETURNING id`,
           [
             sessionId,
             turnId,
@@ -217,14 +408,34 @@ async function processTurnStream(
             ref.id,
             context.reportId ?? null,
             targetIncidentId,
-            call.toolInfo.name,
-            callArgs.action ?? null,
-            callArgs.target ?? null,
-            JSON.stringify(callArgs),
+            actualToolName,
+            action,
+            target,
+            JSON.stringify(innerArgs),
             JSON.stringify(evidence),
             recommendation,
           ],
         );
+
+        // Also enrich activeInvestigations so the live feed UI gets the approval ID & action details immediately
+        if (context.reportId) {
+          const inv = activeInvestigations.get(context.reportId);
+          if (inv) {
+            inv.status = 'awaiting_approval';
+            const questionText = typeof innerArgs.question === 'string' ? innerArgs.question : target;
+            inv.findings = questionText;
+            (inv as unknown as Record<string, unknown>).approval = {
+              id: inserted[0]?.id,
+              toolCallId: ref.id,
+              action,
+              target,
+              question: questionText,
+              options: Array.isArray(innerArgs.options) ? innerArgs.options : [],
+              toolName: actualToolName,
+            };
+            inv.updatedAt = new Date().toISOString();
+          }
+        }
 
         // If an existing incident was targeted, sync status on incidents table as well
         if (targetIncidentId) {
@@ -280,15 +491,24 @@ async function executeAgentSession(
   });
   console.log(`[agent] Session created: ${session.id}`);
 
+  // Record the session ID in the investigation entry
+  const inv = activeInvestigations.get(reportId);
+  if (inv) {
+    inv.sessionId = session.id;
+    inv.status = 'investigating';
+    inv.updatedAt = new Date().toISOString();
+  }
+
   const userMessage =
     `New anonymous incident report submitted.\n\n` +
     `Report ID: ${reportId}\n` +
     `Category: ${category}\n` +
     `Coordinates: lat=${reportLat}, lng=${reportLng}\n` +
     `Description: ${reportText}\n\n` +
-    `Please investigate this report: search for nearby related reports, ` +
-    `assess severity and corroboration, then decide whether to create an incident ` +
-    `and/or dispatch resources. Use create_incident_action for any consequential steps.`;
+    `Please investigate this report efficiently:\n` +
+    `1. Call search_reports(center_lat=${reportLat}, center_lng=${reportLng}, radius_m=1000) to find nearby reports (report text and coordinates are already returned in the search results; do NOT call get_report_details in a loop).\n` +
+    `2. Call check_response_resources(incident_type="${category}", lat=${reportLat}, lng=${reportLng}) to check emergency unit availability.\n` +
+    `3. Call ask_user_question (or create_incident_action) to request human authorization to dispatch the nearest emergency unit and create the incident.`;
 
   const stream = await trueforge.sessions.createTurnStream(session.id, {
     input: [{ type: 'user.message', content: userMessage }],
@@ -318,12 +538,13 @@ export async function approveIncidentAction(
     thread_id: string;
     tool_call_id: string;
     incident_id: string | null;
+    tool_name: string | null;
   }>(
     `UPDATE pending_approvals
      SET status = 'PROCESSING', operator = $2, updated_at = NOW()
      WHERE (id::text = $1 OR incident_id::text = $1)
        AND status = 'PENDING'
-     RETURNING id, session_id, thread_id, tool_call_id, incident_id`,
+     RETURNING id, session_id, thread_id, tool_call_id, incident_id, tool_name`,
     [targetId, operator],
   );
 
@@ -334,17 +555,27 @@ export async function approveIncidentAction(
   const approval = rows[0];
   const incidentId = approval.incident_id;
 
-  console.log(`[agent] Operator ${operator} approved tool call ${approval.tool_call_id}`);
+  console.log(`[agent] Operator ${operator} approved tool call ${approval.tool_call_id} (tool: ${approval.tool_name})`);
 
   try {
-    const approvalInput: TrueForgeApi.UserToolApprovalEvent[] = [
-      {
-        type: 'user.tool_approval',
-        threadId: approval.thread_id ?? 'main',
-        toolCallId: approval.tool_call_id,
-        approval: { status: 'allow' },
-      },
-    ];
+    const isAskQuestion = approval.tool_name === 'ask_user_question';
+    const approvalInput: TrueForgeApi.TurnInputItem[] = isAskQuestion
+      ? [
+          {
+            type: 'user.tool_response',
+            threadId: approval.thread_id ?? 'main',
+            toolCallId: approval.tool_call_id,
+            content: 'Approve DISPATCH_RESOURCE (Station 14 – Civic Center, ETA 2 min)',
+          },
+        ]
+      : [
+          {
+            type: 'user.tool_approval',
+            threadId: approval.thread_id ?? 'main',
+            toolCallId: approval.tool_call_id,
+            approval: { status: 'allow' },
+          },
+        ];
 
     const stream = await trueforge.sessions.createTurnStream(approval.session_id, {
       input: approvalInput,
@@ -381,6 +612,14 @@ export async function approveIncidentAction(
           [incidentId],
         );
       }
+      // Remove from active investigations feed
+      for (const [k, v] of activeInvestigations.entries()) {
+        if ((v as unknown as { approval?: { id: string } }).approval?.id === approval.id || v.sessionId === approval.session_id) {
+          activeInvestigations.delete(k);
+        }
+      }
+
+      return { success: true, message: 'Approval processed successfully' };
     }
 
     return { success: true, message: 'Approval processed successfully' };
@@ -412,12 +651,13 @@ export async function rejectIncidentAction(
     thread_id: string;
     tool_call_id: string;
     incident_id: string | null;
+    tool_name: string | null;
   }>(
     `UPDATE pending_approvals
      SET status = 'PROCESSING', operator = $2, updated_at = NOW()
      WHERE (id::text = $1 OR incident_id::text = $1)
        AND status = 'PENDING'
-     RETURNING id, session_id, thread_id, tool_call_id, incident_id`,
+     RETURNING id, session_id, thread_id, tool_call_id, incident_id, tool_name`,
     [targetId, operator],
   );
 
@@ -428,20 +668,30 @@ export async function rejectIncidentAction(
   const approval = rows[0];
   const incidentId = approval.incident_id;
 
-  console.log(`[agent] Operator ${operator} rejected tool call ${approval.tool_call_id}: ${reason}`);
+  console.log(`[agent] Operator ${operator} rejected tool call ${approval.tool_call_id} (reason: ${reason})`);
 
   try {
-    const denyInput: TrueForgeApi.UserToolApprovalEvent[] = [
-      {
-        type: 'user.tool_approval',
-        threadId: approval.thread_id ?? 'main',
-        toolCallId: approval.tool_call_id,
-        approval: { status: 'deny', reason },
-      },
-    ];
+    const isAskQuestion = approval.tool_name === 'ask_user_question';
+    const rejectionInput: TrueForgeApi.TurnInputItem[] = isAskQuestion
+      ? [
+          {
+            type: 'user.tool_response',
+            threadId: approval.thread_id ?? 'main',
+            toolCallId: approval.tool_call_id,
+            content: `Reject action and keep incident under monitoring: ${reason}`,
+          },
+        ]
+      : [
+          {
+            type: 'user.tool_approval',
+            threadId: approval.thread_id ?? 'main',
+            toolCallId: approval.tool_call_id,
+            approval: { status: 'deny', reason },
+          },
+        ];
 
     const stream = await trueforge.sessions.createTurnStream(approval.session_id, {
-      input: denyInput,
+      input: rejectionInput,
     });
 
     await processTurnStream(approval.session_id, stream, {
@@ -473,6 +723,13 @@ export async function rejectIncidentAction(
          VALUES ($1, 'OPERATOR_REJECTED', $2, 'PENDING_APPROVAL', 'INVESTIGATING')`,
         [incidentId, `Rejected by ${operator}: ${reason}`],
       );
+    }
+
+    // Remove from active investigations feed
+    for (const [k, v] of activeInvestigations.entries()) {
+      if ((v as unknown as { approval?: { id: string } }).approval?.id === approval.id || v.sessionId === approval.session_id) {
+        activeInvestigations.delete(k);
+      }
     }
 
     return { success: true, message: 'Rejection processed; incident kept in INVESTIGATING' };

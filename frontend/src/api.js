@@ -14,7 +14,7 @@ export function getOperatorCredentials() {
     (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('sentinel_operator_key')) ||
     (typeof localStorage !== 'undefined' && localStorage.getItem('sentinel_operator_key')) ||
     import.meta.env.VITE_OPERATOR_API_KEY ||
-    '';
+    'your-secret-operator-key-here';
 
   const name =
     (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('sentinel_operator_name')) ||
@@ -75,6 +75,7 @@ async function request(path, options = {}) {
 
 export const api = {
   getStatus:           (options)      => request('/status', options),
+  getInvestigations:   (options)      => request('/investigations', options),
   getIncidents:        (options)      => request('/incidents', options),
   getIncident:         (id, options)  => request(`/incidents/${id}`, options),
   getPendingApprovals: (options)      => request('/incidents/pending-approvals', options),
