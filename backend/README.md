@@ -1,5 +1,7 @@
 # Sentinel Backend
 
+**Team:** BlackBox
+
 Node/TypeScript Express service that:
 
 1. Accepts anonymous incident reports from the frontend and persists them to the shared Supabase database.
@@ -37,13 +39,14 @@ Create `backend/.env` (see `.env.example`):
 
 ---
 
-## Setup
+## Local Setup
 
 ### 1. Run the DB migrations
 
 Run the automated migration runner (applies all files in `src/migrations/`):
 
 ```bash
+cd backend
 node run-migration.js
 ```
 
@@ -53,20 +56,20 @@ This is idempotent — safe to re-run.
 
 ```bash
 cd backend
-npm install
+pnpm install
 ```
 
 ### 3. Start in dev mode
 
 ```bash
-npm run dev
+pnpm run dev
 ```
 
 Or build and run for production:
 
 ```bash
-npm run build
-npm start
+pnpm run build
+pnpm run start
 ```
 
 ---
