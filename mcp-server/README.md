@@ -38,8 +38,12 @@ DATABASE_URL="postgresql://postgres:password@localhost:5432/postgres"
 ```
 
 ### 2. Initialize Database Schema & Seed Data
+Export your database URL in your terminal (or load it from `.env`) before running `psql`:
 ```bash
 cd mcp-server
+
+# Export connection string to terminal environment
+export DATABASE_URL="postgresql://postgres:password@localhost:5432/postgres"
 
 # Apply tables, indexes, and PostGIS extensions
 psql "$DATABASE_URL" -f schema.sql

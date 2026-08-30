@@ -21,7 +21,7 @@ Sentinel is structured into four core components that work together to ingest, c
 │  • Real-Time Signal Stream                      • Evidence Convergence Timeline        │
 │  • 6-Stage Investigation Pipeline               • High-Stakes Human Approval Gateway   │
 └───────────────────────────────────────────┬────────────────────────────────────────────┘
-                                            │ REST / SSE
+                                            │ REST / Polling
                                             ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                                   SENTINEL BACKEND                                     │
@@ -77,40 +77,46 @@ Most of our friction was in deployment, not in building the agent itself. Gettin
 ### Prerequisites
 - **Node.js:** `>= 22.0.0`
 - **pnpm:** `>= 11.0.0`
-- **Python:** `>= 3.10` with [`uv`](https://docs.astral.sh/uv/)
+- **Python:** `>= 3.11` with [`uv`](https://docs.astral.sh/uv/)
 - **PostgreSQL:** PostgreSQL database with `pgcrypto` enabled (e.g. Supabase)
 
 ### 1. Database Setup
 ```bash
-# Run schema and seed from mcp-server directory
+# Navigate to mcp-server from repository root
 cd mcp-server
+export DATABASE_URL="postgresql://postgres:password@localhost:5432/postgres"
 psql "$DATABASE_URL" -f schema.sql
 psql "$DATABASE_URL" -f seed.sql
+cd ..
 ```
 
 ### 2. Backend Setup
-For detailed backend documentation, see [`backend/README.md`](file:///Users/aayushigupta/Desktop/Sentinal/backend/README.md).
+For detailed backend documentation, see [backend/README.md](backend/README.md).
 ```bash
+# Navigate to backend from repository root
 cd backend
 cp .env.example .env     # Configure your DATABASE_URL and secrets
+pnpm install             # Install dependencies first
 node run-migration.js    # Run database migrations
-pnpm install             # Install dependencies
 pnpm run dev             # Starts server at http://localhost:3001
+cd ..
 ```
 
 ### 3. MCP Server & Agent Setup
+For detailed MCP server documentation, see [mcp-server/README.md](mcp-server/README.md).
 ```bash
+# Terminal 1: Run MCP Server (from repository root)
 cd mcp-server
 uv run python mcp_server.py
-```
-In a separate terminal, launch the TrueForge agent engine:
-```bash
+
+# Terminal 2: Run TrueForge Agent Engine
 npx @truefoundry/trueforge
 ```
 
 ### 4. Frontend Setup
-For detailed frontend documentation, see [`frontend/README.md`](file:///Users/aayushigupta/Desktop/Sentinal/frontend/README.md).
+For detailed frontend documentation, see [frontend/README.md](frontend/README.md).
 ```bash
+# Terminal 3: Run Tactical Console (from repository root)
 cd frontend
 pnpm install             # Install dependencies
 pnpm run dev             # Starts tactical console at http://localhost:5173
